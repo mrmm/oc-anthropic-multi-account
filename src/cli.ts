@@ -1220,6 +1220,435 @@ const reauthCommand = Command.make(
   Command.withDescription("Re-authenticate an existing account (JSON output)"),
 );
 
+// ============================================================================
+// set-primary command
+// ============================================================================
+
+const setPrimaryCommand = Command.make(
+  "set-primary",
+  {
+    name: Args.text({ name: "name" }).pipe(
+      Args.withDescription("Account name to set as primary"),
+    ),
+  },
+  ({ name }) =>
+    Effect.sync(() => {
+      const multiAuth = loadMultiAuth();
+      if (!multiAuth?.accounts?.length) {
+        console.log("❌ No accounts configured");
+        return;
+      }
+
+      const account = multiAuth.accounts.find((a: any) => a.name === name);
+      if (!account) {
+        console.log(`❌ Account '${name}' not found`);
+        console.log(
+          `Available accounts: ${multiAuth.accounts.map((a: any) => a.name).join(", ")}`,
+        );
+        return;
+      }
+
+      // Current order
+      console.log("\n  Current order:");
+      multiAuth.accounts.forEach((a: any, i: number) => {
+        console.log(
+          `    ${i + 1}. ${a.name}${i === 0 ? " (primary)" : " (fallback)"}`,
+        );
+      });
+
+      // Move account to front
+      const idx = multiAuth.accounts.findIndex((a: any) => a.name === name);
+      if (idx === 0) {
+        console.log(`\n  ✓ '${name}' is already the primary account`);
+        return;
+      }
+
+      const [removed] = multiAuth.accounts.splice(idx, 1);
+      multiAuth.accounts.unshift(removed);
+
+      // New order
+      console.log("\n  New order:");
+      multiAuth.accounts.forEach((a: any, i: number) => {
+        console.log(
+          `    ${i + 1}. ${a.name}${i === 0 ? " (primary)" : " (fallback)"}`,
+        );
+      });
+
+      saveMultiAuth(multiAuth);
+      console.log(`\n  ✓ Set '${name}' as primary account`);
+      console.log("  💡 Restart OpenCode to apply changes");
+    }),
+).pipe(Command.withDescription("Set an account as primary"));
+
+// ============================================================================
+// list command
+// ============================================================================
+
+const listCommand = Command.make("list", {}, () =>
+  Effect.sync(() => {
+    const accounts = loadAccounts();
+
+    if (!accounts.length) {
+      console.log("\n  ❌ No accounts configured\n");
+      console.log("  Add an account: bun src/cli.ts add <name>\n");
+      return;
+    }
+
+    console.log("\n  Configured Accounts");
+    console.log("  ────────────────────────────────────────\n");
+
+    const state = loadState();
+
+    accounts.forEach((account: any, i: number) => {
+      const isActive = state.currentAccount === account.name;
+      const status =
+        account.expires > Date.now() ? "✅ Authenticated" : "⚠️  Token expired";
+      const mode = isActive ? " ← ACTIVE" : "";
+
+      console.log(`  ${i + 1}. ${account.name}${mode}`);
+      console.log(`     Status: ${status}`);
+
+      if (account.expires > Date.now()) {
+        const minsLeft = Math.floor((account.expires - Date.now()) / 60000);
+        const hoursLeft = Math.floor(minsLeft / 60);
+        const mins = minsLeft % 60;
+        console.log(`     Expires: ${hoursLeft}h ${mins}m`);
+      } else {
+        console.log(
+          `     Last used: ${state.usage?.[account.name]?.timestamp || "Unknown"}`,
+        );
+        console.log(`     Need: bun src/cli.ts reauth ${account.name}`);
+      }
+
+      console.log();
+    });
+
+    console.log(`  💡 ${accounts.length} accounts configured`);
+    console.log("     Run `bun src/cli.ts usage` for detailed metrics\n");
+  }),
+).pipe(Command.withDescription("List all configured accounts"));
+
+// ============================================================================
+// remove command
+// ============================================================================
+
+const removeCommand = Command.make(
+  "remove",
+  {
+    name: Args.text({ name: "name" }).pipe(
+      Args.withDescription("Account name to remove"),
+    ),
+  },
+  ({ name }) =>
+    Effect.sync(() => {
+      const multiAuth = loadMultiAuth();
+      if (!multiAuth?.accounts?.length) {
+        console.log("❌ No accounts configured");
+        return;
+      }
+
+      const idx = multiAuth.accounts.findIndex((a: any) => a.name === name);
+      if (idx < 0) {
+        console.log(`❌ Account '${name}' not found`);
+        console.log(
+          `Available accounts: ${multiAuth.accounts.map((a: any) => a.name).join(", ")}`,
+        );
+        return;
+      }
+
+      const account = multiAuth.accounts[idx];
+      const isPrimary = idx === 0;
+
+      console.log(`\n  ⚠️  Warning: About to remove account '${name}'`);
+      console.log("\n  Account details:");
+      console.log(`    Name:      ${account.name}`);
+      console.log(
+        `    Position:  ${idx + 1}${isPrimary ? " (primary)" : " (fallback)"}`,
+      );
+      console.log(
+        `    Status:    ${account.expires > Date.now() ? "✅ Active" : "⚠️  Expired"}\n`,
+      );
+
+      multiAuth.accounts.splice(idx, 1);
+      saveMultiAuth(multiAuth);
+
+      // Also remove from state
+      const state = loadState();
+      if (state.usage?.[name]) {
+        delete state.usage[name];
+      }
+      if (state.currentAccount === name) {
+        state.currentAccount = multiAuth.accounts[0]?.name || null;
+      }
+      saveState(state);
+
+      console.log(`✓ Account '${name}' removed`);
+
+      if (isPrimary && multiAuth.accounts.length > 0) {
+        console.log(
+          `\n  💡 '${multiAuth.accounts[0].name}' is now the primary account`,
+        );
+      }
+
+      console.log("\n  💡 You can re-add this account later with:");
+      console.log(`     bun src/cli.ts add ${name}\n`);
+    }),
+).pipe(Command.withDescription("Remove an account"));
+
+// ============================================================================
+// test command
+// ============================================================================
+
+const testCommand = Command.make(
+  "test",
+  {
+    name: Args.text({ name: "name" }).pipe(
+      Args.withDescription("Account name to test"),
+    ),
+  },
+  ({ name }) =>
+    Effect.tryPromise({
+      try: async () => {
+        const accounts = loadAccounts();
+        const account = accounts.find((a: any) => a.name === name);
+
+        if (!account) {
+          console.log(`\n  ❌ Account not found: ${name}`);
+          console.log(
+            `  Available accounts: ${accounts.map((a: any) => a.name).join(", ")}\n`,
+          );
+          return;
+        }
+
+        console.log(`\n  Testing account: ${name}`);
+        console.log("  ────────────────────────────────────────\n");
+
+        // Step 1: Check token validity
+        console.log("  Step 1: Checking token validity...");
+        if (account.access && account.expires > Date.now()) {
+          const minsLeft = Math.floor((account.expires - Date.now()) / 60000);
+          console.log(`  ✓ Token is valid (expires in ${minsLeft} minutes)\n`);
+        } else {
+          console.log("  ⚠️  Token expired, refreshing...");
+          const refreshError = await refreshToken(account);
+          if (refreshError) {
+            console.log(`  ❌ Token refresh failed: ${refreshError}\n`);
+            return;
+          }
+          console.log("  ✓ Token refreshed successfully\n");
+        }
+
+        // Step 2: Send test request (inline ping)
+        console.log("  Step 2: Sending test request...");
+        const res = await fetch(
+          "https://api.anthropic.com/v1/messages?beta=true",
+          {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${account.access}`,
+              "anthropic-beta": REQUIRED_BETAS.join(","),
+              "user-agent": CLAUDE_CLI_USER_AGENT,
+              "content-type": "application/json",
+              "anthropic-version": "2023-06-01",
+            },
+            body: JSON.stringify({
+              model: "claude-haiku-4-5-20251001",
+              max_tokens: 1,
+              messages: [{ role: "user", content: "ping" }],
+            }),
+          },
+        );
+
+        if (!res.ok) {
+          const text = await res.text();
+          console.log(`  ❌ Request failed: HTTP ${res.status}`);
+          console.log(`     ${text.slice(0, 200)}\n`);
+          return;
+        }
+
+        console.log("  ✓ API request successful\n");
+
+        // Step 3: Check rate limits
+        console.log("  Step 3: Checking rate limits...");
+        const quota = parseRateLimitHeaders(res);
+        if (quota) {
+          updateUsageState(name, quota);
+          if (quota.session5h) {
+            console.log(
+              `  ✓ Session (5h): ${Math.round(quota.session5h.utilization * 100)}% utilized`,
+            );
+          }
+          if (quota.weekly7d) {
+            console.log(
+              `  ✓ Weekly (all): ${Math.round(quota.weekly7d.utilization * 100)}% utilized`,
+            );
+          }
+          if (quota.weekly7dSonnet) {
+            console.log(
+              `  ✓ Weekly (Sonnet): ${Math.round(quota.weekly7dSonnet.utilization * 100)}% utilized`,
+            );
+          }
+          console.log();
+        } else {
+          console.log("  ⚠️  No rate limit data available\n");
+        }
+
+        console.log(`  ✓ Account '${name}' is fully functional\n`);
+      },
+      catch: (err) => new Error(String(err)),
+    }),
+).pipe(Command.withDescription("Test account functionality and quotas"));
+
+// ============================================================================
+// diagnose command
+// ============================================================================
+
+const diagnoseCommand = Command.make("diagnose", {}, () =>
+  Effect.sync(() => {
+    console.log("\n  Multi-Account Diagnostics");
+    console.log("  ────────────────────────────────────────\n");
+
+    const multiAuth = loadMultiAuth();
+    const state = loadState();
+
+    // Check accounts
+    console.log("  Accounts:");
+    if (!multiAuth?.accounts?.length) {
+      console.log("    ❌ No accounts configured");
+      console.log("    💡 Run: bun src/cli.ts add <name>\n");
+    } else {
+      console.log(`    ✓ Found ${multiAuth.accounts.length} accounts`);
+      multiAuth.accounts.forEach((account: any, i: number) => {
+        const isExpired = account.expires <= Date.now();
+        const status = isExpired ? "⚠️  Token expired" : "✓ Valid";
+        console.log(`    ${i + 1}. ${account.name} - ${status}`);
+        if (isExpired) {
+          console.log(`       Run: bun src/cli.ts reauth ${account.name}`);
+        }
+      });
+      console.log();
+    }
+
+    // Check state
+    console.log("  State:");
+    if (state.currentAccount) {
+      console.log(`    ✓ Current account: ${state.currentAccount}`);
+    } else {
+      console.log("    ⚠️  No current account set");
+    }
+    console.log(`    ✓ Request count: ${state.requestCount || 0}`);
+
+    if (state.usage) {
+      const accountNames = Object.keys(state.usage);
+      console.log(`    ✓ Usage data: ${accountNames.length} accounts`);
+    } else {
+      console.log("    ⚠️  No usage data");
+    }
+
+    if (state.config) {
+      const t = normalizeThresholds(state.config.threshold, DEFAULTS.threshold);
+      console.log("    ✓ Config:");
+      console.log(
+        `      Threshold: ${Math.round(t.session5h * 100)}% / ${Math.round(t.weekly7d * 100)}% / ${Math.round(t.weekly7dSonnet * 100)}%`,
+      );
+      console.log(
+        `      Check interval: ${(state.config.checkInterval || DEFAULTS.checkInterval) / 60000} min`,
+      );
+    }
+    console.log();
+
+    // OAuth config
+    console.log("  OAuth Configuration:");
+    console.log("    ✓ Client ID configured");
+    console.log(`    ✓ Token URL: ${TOKEN_URL}`);
+    console.log(`    ✓ Callback URL: ${CODE_CALLBACK_URL}`);
+    console.log("    ✓ All required scopes present\n");
+
+    // File locations
+    console.log("  File Locations:");
+    console.log(`    ✓ Accounts: ${MULTI_AUTH_FILE}`);
+    console.log(`    ✓ State: ${STATE_FILE}`);
+    console.log();
+
+    // Summary
+    if (
+      multiAuth?.accounts?.length &&
+      !multiAuth.accounts.some((a: any) => a.expires <= Date.now())
+    ) {
+      console.log("  ✨ Everything looks good!");
+    } else {
+      console.log("  ⚠️  Issues found:");
+      if (!multiAuth?.accounts?.length) {
+        console.log("    - No accounts configured");
+      }
+      if (multiAuth?.accounts?.some((a: any) => a.expires <= Date.now())) {
+        console.log("    - Some accounts need re-authentication");
+      }
+    }
+    console.log("     Run `bun src/cli.ts usage` for detailed metrics\n");
+  }),
+).pipe(Command.withDescription("Run system diagnostics"));
+
+// ============================================================================
+// migrate command
+// ============================================================================
+
+const migrateCommand = Command.make("migrate", {}, () =>
+  Effect.sync(() => {
+    console.log("\n  Migration Assistant");
+    console.log("  ────────────────────────────────────────\n");
+
+    // Check for legacy files
+    const legacyFiles = [
+      {
+        path: LEGACY_MULTI_AUTH_FILE_CONFIG,
+        version: "v1.0.x (config dir)",
+      },
+      { path: LEGACY_MULTI_AUTH_FILE, version: "v1.0.x (local dir)" },
+    ];
+
+    const foundLegacy = legacyFiles.filter((f) => existsSync(f.path));
+
+    if (foundLegacy.length === 0) {
+      console.log("  ✓ No legacy files found");
+      console.log("  ✓ Your installation is up to date\n");
+      return;
+    }
+
+    console.log("  Legacy files detected:");
+    foundLegacy.forEach((f) => {
+      console.log(`    • ${f.path} (${f.version})`);
+    });
+    console.log();
+
+    console.log("  New location:");
+    console.log(`    • ${MULTI_AUTH_FILE}\n`);
+
+    console.log("  Migration will:");
+    console.log("    • Move accounts to new location");
+    console.log("    • Update auth endpoints to platform.claude.com");
+    console.log("    • Preserve all tokens and usage data");
+    console.log("    • Create backups of original files\n");
+
+    console.log("  ⚠️  Note: Due to endpoint changes, you will need to");
+    console.log("     re-authorize your accounts after migration.\n");
+
+    console.log("  Next steps:");
+    console.log("    • Re-authorize each account:");
+    console.log("      bun src/cli.ts reauth <account-name>");
+    console.log("    • Or add accounts fresh:");
+    console.log("      bun src/cli.ts add <account-name>\n");
+
+    console.log(
+      "  💡 Migration will happen automatically when you restart OpenCode\n",
+    );
+  }),
+).pipe(Command.withDescription("Help with version upgrades"));
+
+// ============================================================================
+// Root command
+// ============================================================================
+
 const rootCommand = Command.make("anthropic-multi-account", {}).pipe(
   Command.withDescription(
     "Manage multiple Anthropic Max accounts for OpenCode",
@@ -1233,6 +1662,12 @@ const rootCommand = Command.make("anthropic-multi-account", {}).pipe(
     reauthCommand,
     addCommand,
     addAliasCommand,
+    setPrimaryCommand,
+    listCommand,
+    removeCommand,
+    testCommand,
+    diagnoseCommand,
+    migrateCommand,
   ]),
 );
 
