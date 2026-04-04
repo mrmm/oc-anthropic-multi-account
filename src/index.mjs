@@ -242,23 +242,69 @@ function saveState(state) {
 }
 
 function createOAuthTokenRequestInit(params) {
-  const body = new URLSearchParams();
+  const body = {};
 
   for (const [key, value] of Object.entries(params)) {
     if (typeof value !== "undefined" && value !== null) {
-      body.set(key, String(value));
+      body[key] = String(value);
     }
   }
 
   return {
     method: "POST",
     headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      Accept: "application/json",
-      "User-Agent": CLAUDE_CLI_USER_AGENT,
+      "Content-Type": "application/json",
+      Accept: "application/json, text/plain, */*",
+      "User-Agent": "axios/1.13.6",
     },
-    body: body.toString(),
+    body: JSON.stringify(body),
   };
+}
+
+function isNetworkError(error) {
+  return (
+    error instanceof Error &&
+    (error.message.includes("fetch failed") ||
+      ("code" in error &&
+        [
+          "ECONNRESET",
+          "ECONNREFUSED",
+          "ETIMEDOUT",
+          "UND_ERR_CONNECT_TIMEOUT",
+        ].includes(error.code)))
+  );
+}
+
+function parseCallbackInput(input) {
+  const trimmed = input.trim();
+
+  // Try parsing as URL
+  try {
+    const url = new URL(trimmed);
+    const code = url.searchParams.get("code");
+    const state = url.searchParams.get("state");
+    if (code && state) {
+      return { code, state };
+    }
+  } catch {
+    // Fall through to other formats
+  }
+
+  // Try code#state format
+  const hashSplits = trimmed.split("#");
+  if (hashSplits.length === 2 && hashSplits[0] && hashSplits[1]) {
+    return { code: hashSplits[0], state: hashSplits[1] };
+  }
+
+  // Try URLSearchParams
+  const params = new URLSearchParams(trimmed);
+  const code = params.get("code");
+  const state = params.get("state");
+  if (code && state) {
+    return { code, state };
+  }
+
+  return null;
 }
 
 // NOTE: Duplicated in src/cli.ts:624-626 - both are entry points that need state generation
@@ -296,63 +342,65 @@ async function authorize(mode) {
  * Exchange authorization code for tokens
  * @param {string} code - Authorization code (full URL, raw code, or code#state format)
  * @param {string} verifier - PKCE code verifier
+ * @param {string} redirectUri - OAuth redirect URI
  * @param {string} expectedState - State returned from authorize() to verify against callback
  */
-async function exchange(code, verifier, expectedState) {
-  // Parse callback input to extract code and state
-  // Supports three formats:
-  // 1. Full URL: https://platform.claude.com/oauth/code/callback?code=XXX&state=YYY
-  // 2. Code#state format: code#state (alternative input format from CLI)
-  // 3. Raw code: just the authorization code
-  let authCode = code;
-  let callbackState = null;
-  
-  // Try parsing as URL first
-  try {
-    const url = new URL(code);
-    const codeParam = url.searchParams.get("code");
-    const stateParam = url.searchParams.get("state");
-    if (codeParam) {
-      authCode = codeParam;
-      callbackState = stateParam;
-    }
-  } catch {
-    // Not a URL — check for code#state format
-    // This alternative input format allows passing state alongside code
-    // Format: authorization_code#state_value
-    const splits = code.split("#");
-    if (splits.length === 2) {
-      authCode = splits[0];
-      callbackState = splits[1];
-    }
-  }
-  
-  // CSRF Protection: Verify state matches expected value
-  // The state parameter prevents CSRF attacks by ensuring the callback
-  // originated from the authorization request we initiated
-  if (expectedState && callbackState !== expectedState) {
+async function exchange(code, verifier, redirectUri, expectedState) {
+  const callback = parseCallbackInput(code);
+  if (!callback) return { type: "failed" };
+
+  if (expectedState && callback.state !== expectedState) {
     return { type: "failed" };
   }
-  
-  const result = await fetch(TOKEN_URL, createOAuthTokenRequestInit({
-      code: authCode,
-      state: callbackState,
-      grant_type: "authorization_code",
-      client_id: CLIENT_ID,
-      redirect_uri: CODE_CALLBACK_URL,
-      code_verifier: verifier,
-    }));
-  if (!result.ok)
-    return {
-      type: "failed",
-    };
-  const json = await result.json();
-  return {
-    type: "success",
-    refresh: json.refresh_token,
-    access: json.access_token,
-    expires: Date.now() + json.expires_in * 1000,
-  };
+
+  const maxRetries = 2;
+  const baseDelayMs = 500;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      if (attempt > 0) {
+        const delay = baseDelayMs * Math.pow(2, attempt - 1);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+
+      const response = await fetch(TOKEN_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json, text/plain, */*",
+          "User-Agent": "axios/1.13.6",
+        },
+        body: JSON.stringify({
+          code: callback.code,
+          grant_type: "authorization_code",
+          client_id: CLIENT_ID,
+          redirect_uri: redirectUri,
+          code_verifier: verifier,
+        }),
+      });
+
+      if (!response.ok) {
+        if (response.status >= 500 && attempt < maxRetries) {
+          await response.body?.cancel();
+          continue;
+        }
+        return { type: "failed" };
+      }
+
+      const json = await response.json();
+      return {
+        type: "success",
+        refresh: json.refresh_token,
+        access: json.access_token,
+        expires: Date.now() + json.expires_in * 1000,
+      };
+    } catch (error) {
+      if (isNetworkError(error) && attempt < maxRetries) {
+        continue;
+      }
+      throw error;
+    }
+  }
 }
 
 /**
@@ -1159,14 +1207,13 @@ export async function AnthropicAuthPlugin({ client }) {
           label: "Claude Pro/Max",
           type: "oauth",
           authorize: async () => {
-            const { url, verifier, state } = await authorize("max");
+            const result = await authorize("max");
             return {
-              url: url,
+              url: result.url,
               instructions: "Paste the callback URL or authorization code here: ",
               method: "code",
               callback: async (code) => {
-                const credentials = await exchange(code, verifier, state);
-                return credentials;
+                return exchange(code, result.verifier, result.redirectUri, result.state);
               },
             };
           },
@@ -1175,13 +1222,13 @@ export async function AnthropicAuthPlugin({ client }) {
           label: "Create an API Key",
           type: "oauth",
           authorize: async () => {
-            const { url, verifier, state } = await authorize("console");
+            const result = await authorize("console");
             return {
-              url: url,
+              url: result.url,
               instructions: "Paste the callback URL or authorization code here: ",
               method: "code",
               callback: async (code) => {
-                const credentials = await exchange(code, verifier, state);
+                const credentials = await exchange(code, result.verifier, result.redirectUri, result.state);
                 if (credentials.type === "failed") return credentials;
                 const result = await fetch(
                   `https://api.anthropic.com/api/oauth/claude_cli/create_api_key`,
