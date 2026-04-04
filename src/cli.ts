@@ -621,6 +621,8 @@ function parseAuthCode(input: string): { code: string; state?: string } {
   return { code: input };
 }
 
+// NOTE: Duplicated in src/index.mjs:264-266 - both are entry points that need state generation
+// TODO: Extract to shared module in Task 5
 function generateState(): string {
   return crypto.randomUUID().replace(/-/g, "");
 }

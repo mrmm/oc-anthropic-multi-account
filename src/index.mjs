@@ -261,6 +261,8 @@ function createOAuthTokenRequestInit(params) {
   };
 }
 
+// NOTE: Duplicated in src/cli.ts:624-626 - both are entry points that need state generation
+// TODO: Extract to shared module in Task 5
 function generateState() {
   return crypto.randomUUID().replace(/-/g, "");
 }
@@ -291,25 +293,50 @@ async function authorize(mode) {
 }
 
 /**
- * @param {string} code
- * @param {string} verifier
- * @param {string} [state]
+ * Exchange authorization code for tokens
+ * @param {string} code - Authorization code (full URL, raw code, or code#state format)
+ * @param {string} verifier - PKCE code verifier
+ * @param {string} expectedState - State returned from authorize() to verify against callback
  */
-async function exchange(code, verifier, state) {
-  // Accept both full callback URL and raw code
+async function exchange(code, verifier, expectedState) {
+  // Parse callback input to extract code and state
+  // Supports three formats:
+  // 1. Full URL: https://platform.claude.com/oauth/code/callback?code=XXX&state=YYY
+  // 2. Code#state format: code#state (alternative input format from CLI)
+  // 3. Raw code: just the authorization code
+  let authCode = code;
+  let callbackState = null;
+  
+  // Try parsing as URL first
   try {
     const url = new URL(code);
     const codeParam = url.searchParams.get("code");
+    const stateParam = url.searchParams.get("state");
     if (codeParam) {
-      code = codeParam;
+      authCode = codeParam;
+      callbackState = stateParam;
     }
   } catch {
-    // Not a URL — use as-is
+    // Not a URL — check for code#state format
+    // This alternative input format allows passing state alongside code
+    // Format: authorization_code#state_value
+    const splits = code.split("#");
+    if (splits.length === 2) {
+      authCode = splits[0];
+      callbackState = splits[1];
+    }
   }
-  const splits = code.split("#");
+  
+  // CSRF Protection: Verify state matches expected value
+  // The state parameter prevents CSRF attacks by ensuring the callback
+  // originated from the authorization request we initiated
+  if (expectedState && callbackState !== expectedState) {
+    return { type: "failed" };
+  }
+  
   const result = await fetch(TOKEN_URL, createOAuthTokenRequestInit({
-      code: splits[0],
-      state: state || splits[1],
+      code: authCode,
+      state: callbackState,
       grant_type: "authorization_code",
       client_id: CLIENT_ID,
       redirect_uri: CODE_CALLBACK_URL,
