@@ -538,7 +538,24 @@ function cmdConfig(args: string[]) {
 
   const t = parseArg("--threshold");
   if (t) {
-    state.config.threshold = parseFloat(t);
+    const val = parseFloat(t);
+    if (isNaN(val) || val < 0 || val > 1) {
+      console.error(
+        "❌ Threshold must be a number between 0 and 1 (e.g., 0.80 for 80%)",
+      );
+      return;
+    }
+    if (val < 0.5) {
+      console.warn(
+        "⚠️  Warning: Threshold below 50% may cause frequent switching",
+      );
+    }
+    if (val > 0.95) {
+      console.warn(
+        "⚠️  Warning: Threshold above 95% increases risk of hitting rate limits",
+      );
+    }
+    state.config.threshold = val;
     changed = true;
   }
 
@@ -1701,6 +1718,109 @@ const migrateCommand = Command.make("migrate", {}, () =>
 ).pipe(Command.withDescription("Help with version upgrades"));
 
 // ============================================================================
+// config-interactive command
+// ============================================================================
+
+const interactiveConfigCommand = Command.make("config-interactive", {}, () =>
+  Effect.tryPromise({
+    try: async () => {
+      const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout,
+      });
+      const state = loadState();
+      state.config = state.config || {};
+
+      console.log("\n  Multi-Account Configuration Wizard");
+      console.log("  ─────────────────────────────────────────\n");
+
+      const currentThresholds = normalizeThresholds(
+        state.config.threshold,
+        DEFAULTS.threshold,
+      );
+
+      console.log("  Current thresholds:");
+      console.log(
+        `    Session:      ${Math.round(currentThresholds.session5h * 100)}%`,
+      );
+      console.log(
+        `    Weekly:       ${Math.round(currentThresholds.weekly7d * 100)}%`,
+      );
+      console.log(
+        `    Sonnet:       ${Math.round(currentThresholds.weekly7dSonnet * 100)}%`,
+      );
+      console.log(
+        `    Check interval: ${(state.config.checkInterval || DEFAULTS.checkInterval) / 60000} min\n`,
+      );
+
+      const ask = (q: string): Promise<string> =>
+        new Promise((resolve) => rl.question(q, resolve));
+
+      const session = await ask(
+        `  ? Set session (5h) threshold: (${Math.round(currentThresholds.session5h * 100)}) `,
+      );
+      const weekly = await ask(
+        `  ? Set weekly (all) threshold: (${Math.round(currentThresholds.weekly7d * 100)}) `,
+      );
+      const sonnet = await ask(
+        `  ? Set weekly (Sonnet) threshold: (${Math.round(currentThresholds.weekly7dSonnet * 100)}) `,
+      );
+      const interval = await ask(
+        `  ? Set recovery check interval (minutes): (${(state.config.checkInterval || DEFAULTS.checkInterval) / 60000}) `,
+      );
+
+      // Parse and validate
+      const sessionVal = session
+        ? parseFloat(session) / 100
+        : currentThresholds.session5h;
+      const weeklyVal = weekly
+        ? parseFloat(weekly) / 100
+        : currentThresholds.weekly7d;
+      const sonnetVal = sonnet
+        ? parseFloat(sonnet) / 100
+        : currentThresholds.weekly7dSonnet;
+      const intervalVal = interval
+        ? parseInt(interval) * 60000
+        : state.config.checkInterval || DEFAULTS.checkInterval;
+
+      // Preview
+      console.log("\n  Preview:");
+      console.log("  ─────────────────────────────────────────");
+      console.log(
+        `  Session:      ${Math.round(sessionVal * 100)}% ← will switch when >${Math.round(sessionVal * 100)}%`,
+      );
+      console.log(
+        `  Weekly:       ${Math.round(weeklyVal * 100)}% ← will switch when >${Math.round(weeklyVal * 100)}%`,
+      );
+      console.log(
+        `  Sonnet:       ${Math.round(sonnetVal * 100)}% ← will switch when >${Math.round(sonnetVal * 100)}%`,
+      );
+      console.log(`  Recovery:     every ${intervalVal / 60000} minutes`);
+      console.log("  ─────────────────────────────────────────\n");
+
+      const confirm = await ask("  ? Apply these settings? (Y/n) ");
+
+      if (confirm.toLowerCase() !== "n") {
+        state.config.threshold = {
+          session5h: sessionVal,
+          weekly7d: weeklyVal,
+          weekly7dSonnet: sonnetVal,
+        };
+        state.config.checkInterval = intervalVal;
+        autoEvaluate(state);
+        saveState(state);
+        console.log("\n  ✓ Configuration saved\n");
+      } else {
+        console.log("\n  ✗ Configuration cancelled\n");
+      }
+
+      rl.close();
+    },
+    catch: (err) => (err instanceof Error ? err : new Error(String(err))),
+  }),
+).pipe(Command.withDescription("Interactive configuration wizard"));
+
+// ============================================================================
 // Root command
 // ============================================================================
 
@@ -1713,6 +1833,7 @@ const rootCommand = Command.make("anthropic-multi-account", {}).pipe(
     usageAliasCommand,
     configCommand,
     configAliasCommand,
+    interactiveConfigCommand,
     pingCommand,
     reauthCommand,
     addCommand,
