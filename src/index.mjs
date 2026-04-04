@@ -663,6 +663,60 @@ async function ensureFreshAccountToken(account, multiAuth) {
   return { ok: true };
 }
 
+// ---------------------------------------------------------------------------
+// Header utilities
+// ---------------------------------------------------------------------------
+
+function mergeHeaders(input, init) {
+  const requestHeaders = new Headers();
+
+  if (input instanceof Request) {
+    input.headers.forEach((value, key) => {
+      requestHeaders.set(key, value);
+    });
+  }
+
+  const initHeaders = init?.headers;
+  if (initHeaders) {
+    if (initHeaders instanceof Headers) {
+      initHeaders.forEach((value, key) => {
+        requestHeaders.set(key, value);
+      });
+    } else if (Array.isArray(initHeaders)) {
+      for (const [key, value] of initHeaders) {
+        if (typeof value !== "undefined") {
+          requestHeaders.set(key, String(value));
+        }
+      }
+    } else {
+      for (const [key, value] of Object.entries(initHeaders)) {
+        if (typeof value !== "undefined") {
+          requestHeaders.set(key, String(value));
+        }
+      }
+    }
+  }
+
+  return requestHeaders;
+}
+
+function mergeBetaHeaders(headers) {
+  const incomingBeta = headers.get("anthropic-beta") || "";
+  const incomingBetasList = incomingBeta
+    .split(",")
+    .map((b) => b.trim())
+    .filter(Boolean);
+  return [...new Set([...REQUIRED_BETAS, ...incomingBetasList])].join(",");
+}
+
+function setOAuthHeaders(headers, accessToken) {
+  headers.set("authorization", `Bearer ${accessToken}`);
+  headers.set("anthropic-beta", mergeBetaHeaders(headers));
+  headers.set("user-agent", CLAUDE_CLI_USER_AGENT);
+  headers.delete("x-api-key");
+  return headers;
+}
+
 /**
  * @type {import('@opencode-ai/plugin').Plugin}
  */
@@ -759,54 +813,8 @@ export async function AnthropicAuthPlugin({ client }) {
               state.requestCount = (state.requestCount || 0) + 1;
 
               const requestInit = init ?? {};
-
-              const requestHeaders = new Headers();
-              if (input instanceof Request) {
-                input.headers.forEach((value, key) => {
-                  requestHeaders.set(key, value);
-                });
-              }
-              if (requestInit.headers) {
-                if (requestInit.headers instanceof Headers) {
-                  requestInit.headers.forEach((value, key) => {
-                    requestHeaders.set(key, value);
-                  });
-                } else if (Array.isArray(requestInit.headers)) {
-                  for (const [key, value] of requestInit.headers) {
-                    if (typeof value !== "undefined") {
-                      requestHeaders.set(key, String(value));
-                    }
-                  }
-                } else {
-                  for (const [key, value] of Object.entries(
-                    requestInit.headers,
-                  )) {
-                    if (typeof value !== "undefined") {
-                      requestHeaders.set(key, String(value));
-                    }
-                  }
-                }
-              }
-
-              // Preserve all incoming beta headers while ensuring OAuth requirements
-              const incomingBeta = requestHeaders.get("anthropic-beta") || "";
-              const incomingBetasList = incomingBeta
-                .split(",")
-                .map((b) => b.trim())
-                .filter(Boolean);
-
-              const requiredBetas = REQUIRED_BETAS;
-              const mergedBetas = [
-                ...new Set([...requiredBetas, ...incomingBetasList]),
-              ].join(",");
-
-              requestHeaders.set("authorization", `Bearer ${account.access}`);
-              requestHeaders.set("anthropic-beta", mergedBetas);
-              requestHeaders.set(
-                "user-agent",
-                CLAUDE_CLI_USER_AGENT,
-              );
-              requestHeaders.delete("x-api-key");
+              const requestHeaders = mergeHeaders(input, init);
+              setOAuthHeaders(requestHeaders, account.access);
 
               let body = requestInit.body;
               if (body && typeof body === "string") {
@@ -1073,54 +1081,8 @@ export async function AnthropicAuthPlugin({ client }) {
                 auth.access = json.access_token;
               }
               const requestInit = init ?? {};
-
-              const requestHeaders = new Headers();
-              if (input instanceof Request) {
-                input.headers.forEach((value, key) => {
-                  requestHeaders.set(key, value);
-                });
-              }
-              if (requestInit.headers) {
-                if (requestInit.headers instanceof Headers) {
-                  requestInit.headers.forEach((value, key) => {
-                    requestHeaders.set(key, value);
-                  });
-                } else if (Array.isArray(requestInit.headers)) {
-                  for (const [key, value] of requestInit.headers) {
-                    if (typeof value !== "undefined") {
-                      requestHeaders.set(key, String(value));
-                    }
-                  }
-                } else {
-                  for (const [key, value] of Object.entries(
-                    requestInit.headers,
-                  )) {
-                    if (typeof value !== "undefined") {
-                      requestHeaders.set(key, String(value));
-                    }
-                  }
-                }
-              }
-
-              // Preserve all incoming beta headers while ensuring OAuth requirements
-              const incomingBeta = requestHeaders.get("anthropic-beta") || "";
-              const incomingBetasList = incomingBeta
-                .split(",")
-                .map((b) => b.trim())
-                .filter(Boolean);
-
-              const requiredBetas = REQUIRED_BETAS;
-              const mergedBetas = [
-                ...new Set([...requiredBetas, ...incomingBetasList]),
-              ].join(",");
-
-              requestHeaders.set("authorization", `Bearer ${auth.access}`);
-              requestHeaders.set("anthropic-beta", mergedBetas);
-              requestHeaders.set(
-                "user-agent",
-                CLAUDE_CLI_USER_AGENT,
-              );
-              requestHeaders.delete("x-api-key");
+              const requestHeaders = mergeHeaders(input, init);
+              setOAuthHeaders(requestHeaders, auth.access);
 
               let body = requestInit.body;
               if (body && typeof body === "string") {
