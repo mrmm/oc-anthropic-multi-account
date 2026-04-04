@@ -321,7 +321,7 @@ async function ensureFreshToken(account, multiAuth) {
     });
   }
 
-  account.access = await refreshPromise;
+  await refreshPromise;
   return { ok: true };
 }
 ```
