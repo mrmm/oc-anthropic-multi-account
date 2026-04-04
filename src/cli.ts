@@ -3,25 +3,67 @@
 import { Args, Command, Options } from "@effect/cli";
 import { BunContext, BunRuntime } from "@effect/platform-bun";
 import { generatePKCE } from "@openauthjs/openauth/pkce";
-import { readFileSync, writeFileSync, existsSync, copyFileSync, renameSync, mkdirSync } from "fs";
+import {
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  copyFileSync,
+  renameSync,
+  mkdirSync,
+} from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
 import * as readline from "readline";
 import { Effect, Option } from "effect";
 
 const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-const OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token";
+
+const AUTHORIZE_URLS = {
+  console: "https://platform.claude.com/oauth/authorize",
+  max: "https://claude.ai/oauth/authorize",
+};
+
+const CODE_CALLBACK_URL = "https://platform.claude.com/oauth/code/callback";
+
+const TOKEN_URL = "https://platform.claude.com/v1/oauth/token";
+
+const OAUTH_SCOPES = [
+  "org:create_api_key",
+  "user:profile",
+  "user:inference",
+  "user:sessions:claude_code",
+  "user:mcp_servers",
+  "user:file_upload",
+];
+
+const REQUIRED_BETAS = ["oauth-2025-04-20", "interleaved-thinking-2025-05-14"];
+
+const TOOL_PREFIX = "mcp_";
 const CLAUDE_CLI_USER_AGENT = "claude-cli/2.1.2 (external, cli)";
 const CONFIG_DIR = join(homedir(), ".config/opencode");
-const MULTI_AUTH_FILE = join(CONFIG_DIR, "anthropic-multi-account-accounts.json");
-const LEGACY_MULTI_AUTH_FILE_CONFIG = join(CONFIG_DIR, "anthropic-multi-accounts.json");
-const LEGACY_MULTI_AUTH_FILE = join(homedir(), ".local/share/opencode/multi-account-auth.json");
+const MULTI_AUTH_FILE = join(
+  CONFIG_DIR,
+  "anthropic-multi-account-accounts.json",
+);
+const LEGACY_MULTI_AUTH_FILE_CONFIG = join(
+  CONFIG_DIR,
+  "anthropic-multi-accounts.json",
+);
+const LEGACY_MULTI_AUTH_FILE = join(
+  homedir(),
+  ".local/share/opencode/multi-account-auth.json",
+);
 const STATE_FILE = join(CONFIG_DIR, "anthropic-multi-account-state.json");
-const LEGACY_STATE_FILE = join(homedir(), ".local/share/opencode/multi-account-state.json");
+const LEGACY_STATE_FILE = join(
+  homedir(),
+  ".local/share/opencode/multi-account-state.json",
+);
 
-const DEFAULTS = { threshold: 0.70, checkInterval: 3600000 };
+const DEFAULTS = { threshold: 0.7, checkInterval: 3600000 };
 
-function createOAuthTokenRequestInit(params: Record<string, string | undefined>) {
+function createOAuthTokenRequestInit(
+  params: Record<string, string | undefined>,
+) {
   const body = new URLSearchParams();
 
   for (const [key, value] of Object.entries(params)) {
@@ -41,15 +83,20 @@ function createOAuthTokenRequestInit(params: Record<string, string | undefined>)
   };
 }
 
-type PerMetric = { session5h: number; weekly7d: number; weekly7dSonnet: number };
+type PerMetric = {
+  session5h: number;
+  weekly7d: number;
+  weekly7dSonnet: number;
+};
 
 function normalizeThresholds(value: any, fallback: number): PerMetric {
-  if (typeof value === 'number') return { session5h: value, weekly7d: value, weekly7dSonnet: value };
-  if (typeof value === 'object' && value !== null) {
+  if (typeof value === "number")
+    return { session5h: value, weekly7d: value, weekly7dSonnet: value };
+  if (typeof value === "object" && value !== null) {
     return {
       session5h: value.session5h ?? fallback,
       weekly7d: value.weekly7d ?? fallback,
-      weekly7dSonnet: value.weekly7dSonnet ?? fallback
+      weekly7dSonnet: value.weekly7dSonnet ?? fallback,
     };
   }
   return { session5h: fallback, weekly7d: fallback, weekly7dSonnet: fallback };
@@ -64,11 +111,11 @@ function allSame(pm: PerMetric): boolean {
 // ============================================================================
 
 function safeReadJSON<T>(filePath: string, fallback: T): T {
-  for (const path of [filePath, filePath + '.bak']) {
+  for (const path of [filePath, filePath + ".bak"]) {
     if (!existsSync(path)) continue;
     try {
       const data = JSON.parse(readFileSync(path, "utf-8"));
-      if (path.endsWith('.bak')) {
+      if (path.endsWith(".bak")) {
         console.log(`[multi-account] Recovered ${filePath} from backup`);
       }
       return data;
@@ -83,9 +130,9 @@ function safeWriteJSON(filePath: string, data: any) {
   try {
     mkdirSync(dirname(filePath), { recursive: true });
     if (existsSync(filePath)) {
-      copyFileSync(filePath, filePath + '.bak');
+      copyFileSync(filePath, filePath + ".bak");
     }
-    const tmp = filePath + '.tmp';
+    const tmp = filePath + ".tmp";
     writeFileSync(tmp, JSON.stringify(data, null, 2));
     renameSync(tmp, filePath);
   } catch (e) {
@@ -93,7 +140,10 @@ function safeWriteJSON(filePath: string, data: any) {
   }
 }
 
-function readWithFallback<T>(paths: string[], fallback: T): { data: T; source: string | null } {
+function readWithFallback<T>(
+  paths: string[],
+  fallback: T,
+): { data: T; source: string | null } {
   for (const p of paths) {
     const data = safeReadJSON<T | null>(p, null as T | null);
     if (data !== null) return { data: data as T, source: p };
@@ -109,18 +159,27 @@ function normalizeAccountFields(account: any): any {
   const normalized = { ...account };
   let changed = false;
 
-  if ((!normalized.access || typeof normalized.access !== "string") && typeof normalized.accessToken === "string") {
+  if (
+    (!normalized.access || typeof normalized.access !== "string") &&
+    typeof normalized.accessToken === "string"
+  ) {
     normalized.access = normalized.accessToken;
     changed = true;
   }
 
-  if ((!normalized.refresh || typeof normalized.refresh !== "string") && typeof normalized.refreshToken === "string") {
+  if (
+    (!normalized.refresh || typeof normalized.refresh !== "string") &&
+    typeof normalized.refreshToken === "string"
+  ) {
     normalized.refresh = normalized.refreshToken;
     changed = true;
   }
 
   if (typeof normalized.expires !== "number") {
-    if (typeof normalized.expiresAt === "number" && Number.isFinite(normalized.expiresAt)) {
+    if (
+      typeof normalized.expiresAt === "number" &&
+      Number.isFinite(normalized.expiresAt)
+    ) {
       normalized.expires = normalized.expiresAt;
       changed = true;
     } else if (typeof normalized.expiresAt === "string") {
@@ -135,8 +194,15 @@ function normalizeAccountFields(account: any): any {
   return changed ? normalized : account;
 }
 
-function normalizeMultiAuthShape(multiAuth: any): { value: any; changed: boolean } {
-  if (!multiAuth || typeof multiAuth !== "object" || !Array.isArray(multiAuth.accounts)) {
+function normalizeMultiAuthShape(multiAuth: any): {
+  value: any;
+  changed: boolean;
+} {
+  if (
+    !multiAuth ||
+    typeof multiAuth !== "object" ||
+    !Array.isArray(multiAuth.accounts)
+  ) {
     return { value: multiAuth, changed: false };
   }
 
@@ -161,10 +227,15 @@ function loadAccounts() {
 function loadMultiAuth(): any {
   const { data, source } = readWithFallback(
     [MULTI_AUTH_FILE, LEGACY_MULTI_AUTH_FILE_CONFIG, LEGACY_MULTI_AUTH_FILE],
-    { accounts: [] }
+    { accounts: [] },
   );
   const normalized = normalizeMultiAuthShape(data);
-  if ((source === LEGACY_MULTI_AUTH_FILE_CONFIG || source === LEGACY_MULTI_AUTH_FILE || normalized.changed) && normalized.value) {
+  if (
+    (source === LEGACY_MULTI_AUTH_FILE_CONFIG ||
+      source === LEGACY_MULTI_AUTH_FILE ||
+      normalized.changed) &&
+    normalized.value
+  ) {
     saveMultiAuth(normalized.value);
   }
   return normalized.value;
@@ -175,7 +246,10 @@ function saveMultiAuth(data: any) {
 }
 
 function loadState(): any {
-  const { data, source } = readWithFallback([STATE_FILE, LEGACY_STATE_FILE], {});
+  const { data, source } = readWithFallback(
+    [STATE_FILE, LEGACY_STATE_FILE],
+    {},
+  );
   if (source === LEGACY_STATE_FILE) {
     saveState(data);
   }
@@ -193,22 +267,30 @@ function saveState(state: any) {
 function progressBar(utilization: number): string {
   const pct = Math.round(utilization * 100);
   const filled = Math.floor(pct / 2);
-  const half = (pct % 2 === 1) ? '▌' : '';
-  return '█'.repeat(filled) + half + ' '.repeat(Math.max(0, 50 - filled - (half ? 1 : 0)));
+  const half = pct % 2 === 1 ? "▌" : "";
+  return (
+    "█".repeat(filled) +
+    half +
+    " ".repeat(Math.max(0, 50 - filled - (half ? 1 : 0)))
+  );
 }
 
 function formatResetTime(ts: number | null): string {
   if (!ts) return "Unknown";
-  return new Intl.DateTimeFormat('default', {
-    month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short'
+  return new Intl.DateTimeFormat("default", {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short",
   }).format(new Date(ts * 1000));
 }
 
 const EMPTY_USAGE = {
-  session5h: { utilization: 0, reset: null, status: 'allowed' },
-  weekly7d: { utilization: 0, reset: null, status: 'allowed' },
-  weekly7dSonnet: { utilization: 0, reset: null, status: 'allowed' },
-  timestamp: null
+  session5h: { utilization: 0, reset: null, status: "allowed" },
+  weekly7d: { utilization: 0, reset: null, status: "allowed" },
+  weekly7dSonnet: { utilization: 0, reset: null, status: "allowed" },
+  timestamp: null,
 };
 
 function ensureAllAccountsInState(accounts: any[], state: any): boolean {
@@ -230,11 +312,15 @@ function resolveStaleMetrics(state: any): boolean {
   const now = Date.now();
   let changed = false;
   for (const accountName of Object.keys(usage)) {
-    for (const key of ['session5h', 'weekly7d', 'weekly7dSonnet'] as const) {
+    for (const key of ["session5h", "weekly7d", "weekly7dSonnet"] as const) {
       const metric = usage[accountName]?.[key];
-      if (metric?.reset && metric.reset * 1000 < now && metric.utilization > 0) {
+      if (
+        metric?.reset &&
+        metric.reset * 1000 < now &&
+        metric.utilization > 0
+      ) {
         metric.utilization = 0;
-        metric.status = 'allowed';
+        metric.status = "allowed";
         changed = true;
       }
     }
@@ -252,20 +338,26 @@ function renderUsage(watch: boolean) {
   const accounts = loadAccounts();
   const state = loadState();
   const config = state.config || {};
-  
+
   const accountsChanged = ensureAllAccountsInState(accounts, state);
   const staleResolved = resolveStaleMetrics(state);
   if (accountsChanged || staleResolved) {
     autoEvaluate(state);
     saveState(state);
   }
-  
-  if (watch) process.stdout.write('\x1b[2J\x1b[H');
-  
-  console.log('╔══════════════════════════════════════════════════════════════════╗');
-  console.log('║              anthropic-multi-account                             ║');
-  console.log('╚══════════════════════════════════════════════════════════════════╝');
-  
+
+  if (watch) process.stdout.write("\x1b[2J\x1b[H");
+
+  console.log(
+    "╔══════════════════════════════════════════════════════════════════╗",
+  );
+  console.log(
+    "║              anthropic-multi-account                             ║",
+  );
+  console.log(
+    "╚══════════════════════════════════════════════════════════════════╝",
+  );
+
   if (!accounts.length) {
     console.log("\n  No accounts configured. Run: bun src/cli.ts add <name>\n");
     return;
@@ -273,42 +365,58 @@ function renderUsage(watch: boolean) {
 
   for (const account of accounts) {
     const isActive = state.currentAccount === account.name;
-    const c = isActive ? '\x1b[1;36m' : '';
-    const r = isActive ? '\x1b[0m' : '';
-    
-    console.log(isActive ? `\n${c}┌─ ${account.name} ◄── ACTIVE${r}` : `\n┌─ ${account.name}`);
-    
+    const c = isActive ? "\x1b[1;36m" : "";
+    const r = isActive ? "\x1b[0m" : "";
+
+    console.log(
+      isActive
+        ? `\n${c}┌─ ${account.name} ◄── ACTIVE${r}`
+        : `\n┌─ ${account.name}`,
+    );
+
     const usage = state.usage?.[account.name];
     if (!usage) {
       console.log(`${c}│${r}  No usage data yet`);
       console.log(`${c}└─${r}`);
       continue;
     }
-    
+
     const t = normalizeThresholds(config.threshold, DEFAULTS.threshold);
-    const thresholdMap = { session5h: t.session5h, weekly7d: t.weekly7d, weekly7dSonnet: t.weekly7dSonnet } as const;
-    
-    for (const [label, key] of [['Session (5h)', 'session5h'], ['Weekly (all)', 'weekly7d'], ['Weekly (Sonnet)', 'weekly7dSonnet']] as const) {
+    const thresholdMap = {
+      session5h: t.session5h,
+      weekly7d: t.weekly7d,
+      weekly7dSonnet: t.weekly7dSonnet,
+    } as const;
+
+    for (const [label, key] of [
+      ["Session (5h)", "session5h"],
+      ["Weekly (all)", "weekly7d"],
+      ["Weekly (Sonnet)", "weekly7dSonnet"],
+    ] as const) {
       const u = usage[key]?.utilization || 0;
       const th = thresholdMap[key];
       const thLabel = `\x1b[2m(threshold ${Math.round(th * 100)}%)\x1b[0m`;
       console.log(`${c}│${r}`);
       console.log(`${c}│${r}  ${label}  ${thLabel}`);
-      console.log(`${c}│${r}  ${colorize(progressBar(u), u)}  ${colorize(`${Math.round(u * 100)}%`, u)}`);
+      console.log(
+        `${c}│${r}  ${colorize(progressBar(u), u)}  ${colorize(`${Math.round(u * 100)}%`, u)}`,
+      );
       console.log(`${c}│${r}  Resets ${formatResetTime(usage[key]?.reset)}`);
     }
     console.log(`${c}└─${r}`);
   }
-  
-  console.log('');
-  
+
+  console.log("");
+
   if (watch) {
-    console.log(`  Updated: ${new Date().toLocaleTimeString()}  │  Ctrl+C to exit`);
+    console.log(
+      `  Updated: ${new Date().toLocaleTimeString()}  │  Ctrl+C to exit`,
+    );
   }
 }
 
 function cmdUsage(args: string[]) {
-  const watch = args.includes('--watch') || args.includes('-w');
+  const watch = args.includes("--watch") || args.includes("-w");
   renderUsage(watch);
   if (watch) setInterval(() => renderUsage(true), 5000);
 }
@@ -319,93 +427,129 @@ function cmdUsage(args: string[]) {
 
 function cmdConfig(args: string[]) {
   const state = loadState();
-  
-  if (args.includes('--show') || args.length === 0) {
+
+  if (args.includes("--show") || args.length === 0) {
     const cfg = state.config || {};
     const t = normalizeThresholds(cfg.threshold, DEFAULTS.threshold);
-    
-    console.log('\n  Current config:');
+
+    console.log("\n  Current config:");
     if (allSame(t)) {
       console.log(`    Threshold:      ${Math.round(t.session5h * 100)}%`);
     } else {
       console.log(`    Threshold:`);
       console.log(`      Session (5h):    ${Math.round(t.session5h * 100)}%`);
       console.log(`      Weekly (all):    ${Math.round(t.weekly7d * 100)}%`);
-      console.log(`      Weekly (Sonnet): ${Math.round(t.weekly7dSonnet * 100)}%`);
+      console.log(
+        `      Weekly (Sonnet): ${Math.round(t.weekly7dSonnet * 100)}%`,
+      );
     }
-    console.log(`    Check interval: ${(cfg.checkInterval ?? DEFAULTS.checkInterval) / 60000} min\n`);
+    console.log(
+      `    Check interval: ${(cfg.checkInterval ?? DEFAULTS.checkInterval) / 60000} min\n`,
+    );
     return;
   }
-  
-  if (args.includes('--reset')) {
+
+  if (args.includes("--reset")) {
     delete state.config;
     saveState(state);
-    console.log('✓ Reset to defaults');
+    console.log("✓ Reset to defaults");
     return;
   }
-  
+
   state.config = state.config || {};
   let changed = false;
-  
+
   const parseArg = (flag: string) => {
     const idx = args.indexOf(flag);
     return idx !== -1 ? args[idx + 1] : null;
   };
-  
+
   function ensureThresholdObject() {
     const current = state.config.threshold;
-    if (typeof current === 'number') {
-      state.config.threshold = { session5h: current, weekly7d: current, weekly7dSonnet: current };
-    } else if (!current || typeof current !== 'object') {
-      state.config.threshold = { session5h: DEFAULTS.threshold, weekly7d: DEFAULTS.threshold, weekly7dSonnet: DEFAULTS.threshold };
+    if (typeof current === "number") {
+      state.config.threshold = {
+        session5h: current,
+        weekly7d: current,
+        weekly7dSonnet: current,
+      };
+    } else if (!current || typeof current !== "object") {
+      state.config.threshold = {
+        session5h: DEFAULTS.threshold,
+        weekly7d: DEFAULTS.threshold,
+        weekly7dSonnet: DEFAULTS.threshold,
+      };
     }
   }
-  
-  const t = parseArg('--threshold');
-  if (t) { state.config.threshold = parseFloat(t); changed = true; }
-  
-  // --thresholds 95,80,90 → session=95%, weekly=80%, sonnet=90%
-  const ta = parseArg('--thresholds');
-  if (ta) {
-    const parts = ta.split(',').map(Number);
-    if (parts.length !== 3 || parts.some(isNaN)) {
-      console.error('Usage: --thresholds <session>,<weekly>,<sonnet>  (e.g. --thresholds 95,80,90)');
-      return;
-    }
-    state.config.threshold = { session5h: parts[0] / 100, weekly7d: parts[1] / 100, weekly7dSonnet: parts[2] / 100 };
+
+  const t = parseArg("--threshold");
+  if (t) {
+    state.config.threshold = parseFloat(t);
     changed = true;
   }
-  
-  const ts = parseArg('--threshold-session');
-  if (ts) { ensureThresholdObject(); state.config.threshold.session5h = parseFloat(ts); changed = true; }
-  
-  const tw = parseArg('--threshold-weekly');
-  if (tw) { ensureThresholdObject(); state.config.threshold.weekly7d = parseFloat(tw); changed = true; }
-  
-  const tso = parseArg('--threshold-sonnet');
-  if (tso) { ensureThresholdObject(); state.config.threshold.weekly7dSonnet = parseFloat(tso); changed = true; }
-  
-  const i = parseArg('--interval');
-  if (i) { state.config.checkInterval = parseInt(i) * 60000; changed = true; }
-  
+
+  // --thresholds 95,80,90 → session=95%, weekly=80%, sonnet=90%
+  const ta = parseArg("--thresholds");
+  if (ta) {
+    const parts = ta.split(",").map(Number);
+    if (parts.length !== 3 || parts.some(isNaN)) {
+      console.error(
+        "Usage: --thresholds <session>,<weekly>,<sonnet>  (e.g. --thresholds 95,80,90)",
+      );
+      return;
+    }
+    state.config.threshold = {
+      session5h: parts[0] / 100,
+      weekly7d: parts[1] / 100,
+      weekly7dSonnet: parts[2] / 100,
+    };
+    changed = true;
+  }
+
+  const ts = parseArg("--threshold-session");
+  if (ts) {
+    ensureThresholdObject();
+    state.config.threshold.session5h = parseFloat(ts);
+    changed = true;
+  }
+
+  const tw = parseArg("--threshold-weekly");
+  if (tw) {
+    ensureThresholdObject();
+    state.config.threshold.weekly7d = parseFloat(tw);
+    changed = true;
+  }
+
+  const tso = parseArg("--threshold-sonnet");
+  if (tso) {
+    ensureThresholdObject();
+    state.config.threshold.weekly7dSonnet = parseFloat(tso);
+    changed = true;
+  }
+
+  const i = parseArg("--interval");
+  if (i) {
+    state.config.checkInterval = parseInt(i) * 60000;
+    changed = true;
+  }
+
   // Clean up legacy recover config
   delete state.config.recover;
-  
+
   if (changed) {
     autoEvaluate(state);
     saveState(state);
-    console.log('✓ Config saved');
-    cmdConfig(['--show']);
+    console.log("✓ Config saved");
+    cmdConfig(["--show"]);
   }
 }
 
 function autoEvaluate(state: any) {
   const accounts = loadAccounts();
   if (accounts.length < 2 || !state.currentAccount) return;
-  
+
   const config = state.config || {};
   const t = normalizeThresholds(config.threshold, DEFAULTS.threshold);
-  
+
   function isOverThreshold(usage: any): boolean {
     if (!usage) return false;
     return (
@@ -414,17 +558,19 @@ function autoEvaluate(state: any) {
       (usage.weekly7dSonnet?.utilization || 0) > t.weekly7dSonnet
     );
   }
-  
+
   const primary = accounts[0];
   const currentAccount = state.currentAccount;
   const primaryUsage = state.usage?.[primary.name];
-  
+
   if (currentAccount === primary.name) {
     if (isOverThreshold(primaryUsage)) {
       for (const fallback of accounts.slice(1)) {
         if (!isOverThreshold(state.usage?.[fallback.name])) {
           state.currentAccount = fallback.name;
-          console.log(`  ⚡ Auto-switch: ${primary.name} → ${fallback.name} (exceeds new thresholds)`);
+          console.log(
+            `  ⚡ Auto-switch: ${primary.name} → ${fallback.name} (exceeds new thresholds)`,
+          );
           return;
         }
       }
@@ -432,7 +578,9 @@ function autoEvaluate(state: any) {
   } else {
     if (!isOverThreshold(primaryUsage)) {
       state.currentAccount = primary.name;
-      console.log(`  ⚡ Auto-switch: ${currentAccount} → ${primary.name} (under new thresholds)`);
+      console.log(
+        `  ⚡ Auto-switch: ${currentAccount} → ${primary.name} (under new thresholds)`,
+      );
     }
   }
 }
@@ -442,8 +590,16 @@ function autoEvaluate(state: any) {
 // ============================================================================
 
 async function prompt(q: string): Promise<string> {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  return new Promise(resolve => rl.question(q, a => { rl.close(); resolve(a.trim()); }));
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  return new Promise((resolve) =>
+    rl.question(q, (a) => {
+      rl.close();
+      resolve(a.trim());
+    }),
+  );
 }
 
 // Extract state (verifier) from auth URL
@@ -465,16 +621,22 @@ function parseAuthCode(input: string): { code: string; state?: string } {
   return { code: input };
 }
 
+function generateState(): string {
+  return crypto.randomUUID().replace(/-/g, "");
+}
+
 async function cmdAdd(args: string[]) {
   const name = args[0];
-  const authUrl = args[1];  // The authorization URL (contains state/verifier)
+  const authUrl = args[1]; // The authorization URL (contains state/verifier)
   const authCode = args[2]; // The auth code from callback
 
   if (!name) {
-    console.log('Usage:');
-    console.log('  bun src/cli.ts add <name>                    # Interactive mode');
-    console.log('  bun src/cli.ts add <name> <auth-url> <code>  # Direct mode');
-    console.log('  bun src/cli.ts add <name> <auth-url> <code#state>');
+    console.log("Usage:");
+    console.log(
+      "  bun src/cli.ts add <name>                    # Interactive mode",
+    );
+    console.log("  bun src/cli.ts add <name> <auth-url> <code>  # Direct mode");
+    console.log("  bun src/cli.ts add <name> <auth-url> <code#state>");
     return;
   }
 
@@ -482,15 +644,17 @@ async function cmdAdd(args: string[]) {
 
   let code: string;
   let verifier: string;
+  let state: string;
 
   // Direct mode - URL and code provided
   if (authUrl && authCode) {
-    const state = extractStateFromUrl(authUrl);
+    const extractedState = extractStateFromUrl(authUrl);
     const parsed = parseAuthCode(authCode);
 
     code = parsed.code;
     // Use state from auth code if present, otherwise from URL
-    verifier = parsed.state || state || "";
+    state = parsed.state || extractedState || "";
+    verifier = state;
 
     if (!verifier) {
       console.error("❌ Could not extract state/verifier from URL or code");
@@ -499,16 +663,17 @@ async function cmdAdd(args: string[]) {
   } else {
     // Interactive mode - generate PKCE and show auth URL
     const pkce = await generatePKCE();
+    state = generateState();
 
-    const url = new URL("https://claude.ai/oauth/authorize");
+    const url = new URL(AUTHORIZE_URLS.max);
     url.searchParams.set("code", "true");
     url.searchParams.set("client_id", CLIENT_ID);
     url.searchParams.set("response_type", "code");
-    url.searchParams.set("redirect_uri", "https://console.anthropic.com/oauth/code/callback");
-    url.searchParams.set("scope", "org:create_api_key user:profile user:inference");
+    url.searchParams.set("redirect_uri", CODE_CALLBACK_URL);
+    url.searchParams.set("scope", OAUTH_SCOPES.join(" "));
     url.searchParams.set("code_challenge", pkce.challenge);
     url.searchParams.set("code_challenge_method", "S256");
-    url.searchParams.set("state", pkce.verifier);
+    url.searchParams.set("state", state);
 
     console.log("1. Open this URL in your browser:\n");
     console.log(`   ${url.toString()}\n`);
@@ -530,14 +695,17 @@ async function cmdAdd(args: string[]) {
 
   console.log("⏳ Exchanging code for tokens...");
 
-  const response = await fetch(OAUTH_TOKEN_URL, createOAuthTokenRequestInit({
+  const response = await fetch(
+    TOKEN_URL,
+    createOAuthTokenRequestInit({
       code,
-      state: verifier,
+      state: state,
       grant_type: "authorization_code",
       client_id: CLIENT_ID,
-      redirect_uri: "https://console.anthropic.com/oauth/code/callback",
+      redirect_uri: CODE_CALLBACK_URL,
       code_verifier: verifier,
-    }));
+    }),
+  );
 
   if (!response.ok) {
     const text = await response.text();
@@ -545,11 +713,20 @@ async function cmdAdd(args: string[]) {
     return;
   }
 
-  const json = await response.json() as { access_token: string; refresh_token: string; expires_in: number };
+  const json = (await response.json()) as {
+    access_token: string;
+    refresh_token: string;
+    expires_in: number;
+  };
   const multiAuth = loadMultiAuth();
   multiAuth.accounts ??= [];
 
-  const account = { name, access: json.access_token, refresh: json.refresh_token, expires: Date.now() + json.expires_in * 1000 };
+  const account = {
+    name,
+    access: json.access_token,
+    refresh: json.refresh_token,
+    expires: Date.now() + json.expires_in * 1000,
+  };
   const idx = multiAuth.accounts.findIndex((a: any) => a.name === name);
 
   if (idx >= 0) {
@@ -568,22 +745,30 @@ async function refreshToken(account: any): Promise<string | null> {
   if (account.access && account.expires > Date.now()) return null;
   if (!account.refresh) return "No refresh token available";
   try {
-    const res = await fetch(OAUTH_TOKEN_URL, createOAuthTokenRequestInit({
+    const res = await fetch(
+      TOKEN_URL,
+      createOAuthTokenRequestInit({
         grant_type: "refresh_token",
         refresh_token: account.refresh,
         client_id: CLIENT_ID,
-      }));
+      }),
+    );
     if (!res.ok) {
       const body = await res.text().catch(() => "");
       return `Token refresh failed (${res.status}): ${body.slice(0, 200)}`;
     }
-    const json = await res.json() as { access_token: string; refresh_token: string; expires_in: number };
+    const json = (await res.json()) as {
+      access_token: string;
+      refresh_token: string;
+      expires_in: number;
+    };
     account.access = json.access_token;
     account.refresh = json.refresh_token;
     account.expires = Date.now() + json.expires_in * 1000;
     // Persist refreshed tokens
     const multiAuth = loadMultiAuth();
-    const idx = multiAuth.accounts?.findIndex((a: any) => a.name === account.name) ?? -1;
+    const idx =
+      multiAuth.accounts?.findIndex((a: any) => a.name === account.name) ?? -1;
     if (idx >= 0) {
       multiAuth.accounts[idx] = account;
       saveMultiAuth(multiAuth);
@@ -599,25 +784,34 @@ async function refreshToken(account: any): Promise<string | null> {
 // Header prefixes:  anthropic-ratelimit-unified-{5h,7d,7d_sonnet}-{utilization,reset,status}
 // ---------------------------------------------------------------------------
 
-type QuotaMetric = { utilization: number; reset: number | null; status: string };
-type QuotaSnapshot = { session5h: QuotaMetric | null; weekly7d: QuotaMetric | null; weekly7dSonnet: QuotaMetric | null };
+type QuotaMetric = {
+  utilization: number;
+  reset: number | null;
+  status: string;
+};
+type QuotaSnapshot = {
+  session5h: QuotaMetric | null;
+  weekly7d: QuotaMetric | null;
+  weekly7dSonnet: QuotaMetric | null;
+};
 
 function parseRateLimitHeaders(res: Response): QuotaSnapshot | null {
   function parseMetric(prefix: string): QuotaMetric | null {
     const rawUtil = res.headers.get(`${prefix}-utilization`);
     const rawReset = res.headers.get(`${prefix}-reset`);
     const rawStatus = res.headers.get(`${prefix}-status`);
-    if (rawUtil === null && rawReset === null && rawStatus === null) return null;
+    if (rawUtil === null && rawReset === null && rawStatus === null)
+      return null;
     return {
-      utilization: rawUtil !== null ? (parseFloat(rawUtil) || 0) : 0,
-      reset: rawReset !== null ? (parseInt(rawReset, 10) || null) : null,
-      status: rawStatus ?? 'unknown'
+      utilization: rawUtil !== null ? parseFloat(rawUtil) || 0 : 0,
+      reset: rawReset !== null ? parseInt(rawReset, 10) || null : null,
+      status: rawStatus ?? "unknown",
     };
   }
 
-  const session5h = parseMetric('anthropic-ratelimit-unified-5h');
-  const weekly7d = parseMetric('anthropic-ratelimit-unified-7d');
-  const weekly7dSonnet = parseMetric('anthropic-ratelimit-unified-7d_sonnet');
+  const session5h = parseMetric("anthropic-ratelimit-unified-5h");
+  const weekly7d = parseMetric("anthropic-ratelimit-unified-7d");
+  const weekly7dSonnet = parseMetric("anthropic-ratelimit-unified-7d_sonnet");
   if (!session5h && !weekly7d && !weekly7dSonnet) return null;
   return { session5h, weekly7d, weekly7dSonnet };
 }
@@ -628,11 +822,12 @@ function updateUsageState(alias: string, quota: QuotaSnapshot): void {
   const prev = state.usage[alias] || {};
 
   function mergeMetric(prevMetric: any, newMetric: QuotaMetric | null) {
-    if (!newMetric) return prevMetric || { utilization: 0, reset: null, status: 'allowed' };
+    if (!newMetric)
+      return prevMetric || { utilization: 0, reset: null, status: "allowed" };
     return {
-      utilization: newMetric.utilization ?? (prevMetric?.utilization ?? 0),
-      reset: newMetric.reset ?? (prevMetric?.reset ?? null),
-      status: newMetric.status ?? (prevMetric?.status ?? 'unknown')
+      utilization: newMetric.utilization ?? prevMetric?.utilization ?? 0,
+      reset: newMetric.reset ?? prevMetric?.reset ?? null,
+      status: newMetric.status ?? prevMetric?.status ?? "unknown",
     };
   }
 
@@ -640,7 +835,7 @@ function updateUsageState(alias: string, quota: QuotaSnapshot): void {
     session5h: mergeMetric(prev.session5h, quota.session5h),
     weekly7d: mergeMetric(prev.weekly7d, quota.weekly7d),
     weekly7dSonnet: mergeMetric(prev.weekly7dSonnet, quota.weekly7dSonnet),
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
   };
   saveState(state);
 }
@@ -651,28 +846,42 @@ async function cmdPing(alias: string) {
     const account = accounts.find((item: any) => item.name === alias);
 
     if (!account) {
-      console.log(JSON.stringify({ status: "error", alias, error: `Account not found: ${alias}` }));
+      console.log(
+        JSON.stringify({
+          status: "error",
+          alias,
+          error: `Account not found: ${alias}`,
+        }),
+      );
       return;
     }
 
     if (!account.access && !account.refresh) {
-      console.log(JSON.stringify({ status: "error", alias, error: "Missing access token and refresh token" }));
+      console.log(
+        JSON.stringify({
+          status: "error",
+          alias,
+          error: "Missing access token and refresh token",
+        }),
+      );
       return;
     }
 
     // Refresh token if expired
     const refreshError = await refreshToken(account);
     if (refreshError) {
-      console.log(JSON.stringify({ status: "error", alias, error: refreshError }));
+      console.log(
+        JSON.stringify({ status: "error", alias, error: refreshError }),
+      );
       return;
     }
 
     const res = await fetch("https://api.anthropic.com/v1/messages?beta=true", {
       method: "POST",
       headers: {
-        "authorization": `Bearer ${account.access}`,
-        "anthropic-beta": "oauth-2025-04-20,interleaved-thinking-2025-05-14",
-        "user-agent": "claude-cli/2.1.2 (external, cli)",
+        authorization: `Bearer ${account.access}`,
+        "anthropic-beta": REQUIRED_BETAS.join(","),
+        "user-agent": CLAUDE_CLI_USER_AGENT,
         "content-type": "application/json",
         "anthropic-version": "2023-06-01",
       },
@@ -689,46 +898,69 @@ async function cmdPing(alias: string) {
       if (quota) {
         updateUsageState(alias, quota);
       }
-      console.log(JSON.stringify({ status: "ok", alias, quota: quota ?? undefined }));
+      console.log(
+        JSON.stringify({ status: "ok", alias, quota: quota ?? undefined }),
+      );
       return;
     }
 
     const text = await res.text();
-    console.log(JSON.stringify({ status: "error", alias, error: `HTTP ${res.status}: ${text.slice(0, 200)}` }));
+    console.log(
+      JSON.stringify({
+        status: "error",
+        alias,
+        error: `HTTP ${res.status}: ${text.slice(0, 200)}`,
+      }),
+    );
   } catch (err) {
     console.log(JSON.stringify({ status: "error", alias, error: String(err) }));
   }
 }
 
-async function cmdReauth(alias: string, callbackUrl?: string, verifier?: string) {
+async function cmdReauth(
+  alias: string,
+  callbackUrl?: string,
+  verifier?: string,
+) {
   try {
     const accounts = loadAccounts();
     const account = accounts.find((item: any) => item.name === alias);
 
     if (!account) {
-      console.log(JSON.stringify({ status: "error", alias, error: `Account not found: ${alias}` }));
+      console.log(
+        JSON.stringify({
+          status: "error",
+          alias,
+          error: `Account not found: ${alias}`,
+        }),
+      );
       return;
     }
 
     if (!callbackUrl) {
       // Step 1: Generate auth URL
       const pkce = await generatePKCE();
-      const url = new URL("https://claude.ai/oauth/authorize");
+      const state = generateState();
+      const url = new URL(AUTHORIZE_URLS.max);
       url.searchParams.set("code", "true");
       url.searchParams.set("client_id", CLIENT_ID);
       url.searchParams.set("response_type", "code");
-      url.searchParams.set("redirect_uri", "https://console.anthropic.com/oauth/code/callback");
-      url.searchParams.set("scope", "org:create_api_key user:profile user:inference");
+      url.searchParams.set("redirect_uri", CODE_CALLBACK_URL);
+      url.searchParams.set("scope", OAUTH_SCOPES.join(" "));
       url.searchParams.set("code_challenge", pkce.challenge);
       url.searchParams.set("code_challenge_method", "S256");
-      url.searchParams.set("state", pkce.verifier);
-      console.log(JSON.stringify({ url: url.toString(), verifier: pkce.verifier }));
+      url.searchParams.set("state", state);
+      console.log(
+        JSON.stringify({ url: url.toString(), verifier: pkce.verifier, state }),
+      );
       return;
     }
 
     // Step 2: Exchange callback URL for tokens
     if (!verifier) {
-      console.log(JSON.stringify({ status: "error", alias, error: "Missing --verifier" }));
+      console.log(
+        JSON.stringify({ status: "error", alias, error: "Missing --verifier" }),
+      );
       return;
     }
 
@@ -740,25 +972,43 @@ async function cmdReauth(alias: string, callbackUrl?: string, verifier?: string)
       code = callbackUrl;
     }
 
-    const response = await fetch(OAUTH_TOKEN_URL, createOAuthTokenRequestInit({
+    const response = await fetch(
+      TOKEN_URL,
+      createOAuthTokenRequestInit({
         code,
         state: verifier,
         grant_type: "authorization_code",
         client_id: CLIENT_ID,
-        redirect_uri: "https://console.anthropic.com/oauth/code/callback",
+        redirect_uri: CODE_CALLBACK_URL,
         code_verifier: verifier,
-      }));
+      }),
+    );
 
     if (!response.ok) {
       const text = await response.text();
-      console.log(JSON.stringify({ status: "error", alias, error: `Token exchange failed (${response.status}): ${text.slice(0, 200)}` }));
+      console.log(
+        JSON.stringify({
+          status: "error",
+          alias,
+          error: `Token exchange failed (${response.status}): ${text.slice(0, 200)}`,
+        }),
+      );
       return;
     }
 
-    const json = await response.json() as { access_token: string; refresh_token: string; expires_in: number };
+    const json = (await response.json()) as {
+      access_token: string;
+      refresh_token: string;
+      expires_in: number;
+    };
     const multiAuth = loadMultiAuth();
     multiAuth.accounts ??= [];
-    const updated = { name: alias, access: json.access_token, refresh: json.refresh_token, expires: Date.now() + json.expires_in * 1000 };
+    const updated = {
+      name: alias,
+      access: json.access_token,
+      refresh: json.refresh_token,
+      expires: Date.now() + json.expires_in * 1000,
+    };
     const idx = multiAuth.accounts.findIndex((a: any) => a.name === alias);
     if (idx >= 0) {
       multiAuth.accounts[idx] = updated;
@@ -780,7 +1030,7 @@ const usageCommand = Command.make(
   ({ watch }) =>
     Effect.sync(() => {
       cmdUsage(watch ? ["--watch"] : []);
-    })
+    }),
 ).pipe(Command.withDescription("Show usage across all accounts"));
 
 const usageAliasCommand = Command.make(
@@ -791,7 +1041,7 @@ const usageAliasCommand = Command.make(
   ({ watch }) =>
     Effect.sync(() => {
       cmdUsage(watch ? ["--watch"] : []);
-    })
+    }),
 ).pipe(Command.withDescription("Alias for usage"));
 
 const configCommand = Command.make(
@@ -821,13 +1071,17 @@ const configCommand = Command.make(
       if (show) args.push("--show");
       if (reset) args.push("--reset");
       if (Option.isSome(threshold)) args.push("--threshold", threshold.value);
-      if (Option.isSome(thresholds)) args.push("--thresholds", thresholds.value);
-      if (Option.isSome(thresholdSession)) args.push("--threshold-session", thresholdSession.value);
-      if (Option.isSome(thresholdWeekly)) args.push("--threshold-weekly", thresholdWeekly.value);
-      if (Option.isSome(thresholdSonnet)) args.push("--threshold-sonnet", thresholdSonnet.value);
+      if (Option.isSome(thresholds))
+        args.push("--thresholds", thresholds.value);
+      if (Option.isSome(thresholdSession))
+        args.push("--threshold-session", thresholdSession.value);
+      if (Option.isSome(thresholdWeekly))
+        args.push("--threshold-weekly", thresholdWeekly.value);
+      if (Option.isSome(thresholdSonnet))
+        args.push("--threshold-sonnet", thresholdSonnet.value);
       if (Option.isSome(interval)) args.push("--interval", interval.value);
       cmdConfig(args);
-    })
+    }),
 ).pipe(Command.withDescription("Show or update threshold configuration"));
 
 const configAliasCommand = Command.make(
@@ -857,20 +1111,24 @@ const configAliasCommand = Command.make(
       if (show) args.push("--show");
       if (reset) args.push("--reset");
       if (Option.isSome(threshold)) args.push("--threshold", threshold.value);
-      if (Option.isSome(thresholds)) args.push("--thresholds", thresholds.value);
-      if (Option.isSome(thresholdSession)) args.push("--threshold-session", thresholdSession.value);
-      if (Option.isSome(thresholdWeekly)) args.push("--threshold-weekly", thresholdWeekly.value);
-      if (Option.isSome(thresholdSonnet)) args.push("--threshold-sonnet", thresholdSonnet.value);
+      if (Option.isSome(thresholds))
+        args.push("--thresholds", thresholds.value);
+      if (Option.isSome(thresholdSession))
+        args.push("--threshold-session", thresholdSession.value);
+      if (Option.isSome(thresholdWeekly))
+        args.push("--threshold-weekly", thresholdWeekly.value);
+      if (Option.isSome(thresholdSonnet))
+        args.push("--threshold-sonnet", thresholdSonnet.value);
       if (Option.isSome(interval)) args.push("--interval", interval.value);
       cmdConfig(args);
-    })
+    }),
 ).pipe(Command.withDescription("Alias for config"));
 
 const accountNameArg = Args.text({ name: "name" }).pipe(
-  Args.withDescription("Account alias")
+  Args.withDescription("Account alias"),
 );
 const pingAliasArg = Args.text({ name: "alias" }).pipe(
-  Args.withDescription("Account alias to ping")
+  Args.withDescription("Account alias to ping"),
 );
 const authUrlArg = Args.text({ name: "auth-url" }).pipe(Args.optional);
 const codeArg = Args.text({ name: "code" }).pipe(Args.optional);
@@ -891,8 +1149,10 @@ const addCommand = Command.make(
         await cmdAdd(args);
       },
       catch: (err) => (err instanceof Error ? err : new Error(String(err))),
-    })
-).pipe(Command.withDescription("Add account (interactive OAuth or direct URL+code)"));
+    }),
+).pipe(
+  Command.withDescription("Add account (interactive OAuth or direct URL+code)"),
+);
 
 const addAliasCommand = Command.make(
   "a",
@@ -910,7 +1170,7 @@ const addAliasCommand = Command.make(
         await cmdAdd(args);
       },
       catch: (err) => (err instanceof Error ? err : new Error(String(err))),
-    })
+    }),
 ).pipe(Command.withDescription("Alias for add"));
 
 const pingCommand = Command.make(
@@ -924,11 +1184,11 @@ const pingCommand = Command.make(
         await cmdPing(alias);
       },
       catch: (err) => (err instanceof Error ? err : new Error(String(err))),
-    })
+    }),
 ).pipe(Command.withDescription("Ping an account alias and output JSON"));
 
 const reauthAliasArg = Args.text({ name: "alias" }).pipe(
-  Args.withDescription("Account alias to re-authenticate")
+  Args.withDescription("Account alias to re-authenticate"),
 );
 
 const reauthCommand = Command.make(
@@ -948,11 +1208,15 @@ const reauthCommand = Command.make(
         );
       },
       catch: (err) => (err instanceof Error ? err : new Error(String(err))),
-    })
-).pipe(Command.withDescription("Re-authenticate an existing account (JSON output)"));
+    }),
+).pipe(
+  Command.withDescription("Re-authenticate an existing account (JSON output)"),
+);
 
 const rootCommand = Command.make("anthropic-multi-account", {}).pipe(
-  Command.withDescription("Manage multiple Anthropic Max accounts for OpenCode"),
+  Command.withDescription(
+    "Manage multiple Anthropic Max accounts for OpenCode",
+  ),
   Command.withSubcommands([
     usageCommand,
     usageAliasCommand,
@@ -962,7 +1226,7 @@ const rootCommand = Command.make("anthropic-multi-account", {}).pipe(
     reauthCommand,
     addCommand,
     addAliasCommand,
-  ])
+  ]),
 );
 
 const cli = Command.run(rootCommand, {
