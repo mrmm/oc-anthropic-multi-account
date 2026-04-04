@@ -329,9 +329,9 @@ function resolveStaleMetrics(state: any): boolean {
 }
 
 function colorize(text: string, util: number): string {
-  if (util >= 0.7) return `\x1b[31m${text}\x1b[0m`;
-  if (util >= 0.5) return `\x1b[33m${text}\x1b[0m`;
-  return `\x1b[32m${text}\x1b[0m`;
+  if (util >= 0.9) return `\x1b[31m${text}\x1b[0m`; // Red
+  if (util >= 0.7) return `\x1b[33m${text}\x1b[0m`; // Yellow
+  return `\x1b[32m${text}\x1b[0m`; // Green
 }
 
 function renderUsage(watch: boolean) {
@@ -352,14 +352,16 @@ function renderUsage(watch: boolean) {
     "╔══════════════════════════════════════════════════════════════════╗",
   );
   console.log(
-    "║              anthropic-multi-account                             ║",
+    "║           anthropic-multi-account v1.1.0                          ║",
   );
   console.log(
     "╚══════════════════════════════════════════════════════════════════╝",
   );
 
   if (!accounts.length) {
-    console.log("\n  No accounts configured. Run: bun src/cli.ts add <name>\n");
+    console.log(
+      "\n  ❌ No accounts configured. Run: bun src/cli.ts add <name>\n",
+    );
     return;
   }
 
@@ -368,25 +370,37 @@ function renderUsage(watch: boolean) {
     const c = isActive ? "\x1b[1;36m" : "";
     const r = isActive ? "\x1b[0m" : "";
 
+    // Account status
+    const status =
+      account.expires > Date.now() ? "✅ Authenticated" : "⚠️ Token expired";
+    const bestQuota = isActive ? " ✨ Best quota available" : "";
     console.log(
       isActive
-        ? `\n${c}┌─ ${account.name} ◄── ACTIVE${r}`
+        ? `\n${c}┌─ ${account.name} ◄── ACTIVE${bestQuota}${r}`
         : `\n┌─ ${account.name}`,
     );
+    console.log(`${c}│${r}  Account Status: ${status}`);
+    console.log(`${c}│${r}  Auth Type: Claude Max (OAuth)`);
+    console.log(
+      `${c}│${r}  Scopes: org:create_api_key, user:profile, user:inference,`,
+    );
+    console.log(
+      `${c}│${r}          user:sessions:claude_code, user:mcp_servers, user:file_upload`,
+    );
 
-    const usage = state.usage?.[account.name];
-    if (!usage) {
-      console.log(`${c}│${r}  No usage data yet`);
-      console.log(`${c}└─${r}`);
+    if (!state.usage?.[account.name]) {
+      console.log(`${c}│${r}\n${c}│${r}  ⚠️  No usage data yet`);
+      console.log(`${c}└─${r}\n`);
       continue;
     }
 
+    const usage = state.usage[account.name];
     const t = normalizeThresholds(config.threshold, DEFAULTS.threshold);
     const thresholdMap = {
       session5h: t.session5h,
       weekly7d: t.weekly7d,
       weekly7dSonnet: t.weekly7dSonnet,
-    } as const;
+    };
 
     for (const [label, key] of [
       ["Session (5h)", "session5h"],
@@ -396,13 +410,32 @@ function renderUsage(watch: boolean) {
       const u = usage[key]?.utilization || 0;
       const th = thresholdMap[key];
       const thLabel = `\x1b[2m(threshold ${Math.round(th * 100)}%)\x1b[0m`;
-      console.log(`${c}│${r}`);
-      console.log(`${c}│${r}  ${label}  ${thLabel}`);
+
+      console.log(`${c}│${r}\n${c}│${r}  📊 ${label}  ${thLabel}`);
       console.log(
         `${c}│${r}  ${colorize(progressBar(u), u)}  ${colorize(`${Math.round(u * 100)}%`, u)}`,
       );
       console.log(`${c}│${r}  Resets ${formatResetTime(usage[key]?.reset)}`);
+
+      // Status indicator based on utilization vs threshold
+      if (u > th) {
+        console.log(`${c}│${r}  Status: 🔴 Over threshold! Switch recommended`);
+      } else if (u > th * 0.9) {
+        console.log(
+          `${c}│${r}  Status: 🟡 Approaching threshold (${Math.round(u * 100)}% < ${Math.round(th * 100)}% warning)`,
+        );
+      } else if (u > th * 0.7) {
+        console.log(`${c}│${r}  Status: 🟡 Elevated usage (plan accordingly)`);
+      } else {
+        console.log(`${c}│${r}  Status: 🟢 Under threshold - optimal`);
+      }
     }
+
+    console.log(`${c}│${r}`);
+    console.log(`${c}│${r}  Request Count: ${state.requestCount || 0}`);
+    console.log(
+      `${c}│${r}  Last Request: ${usage.timestamp ? new Date(usage.timestamp).toLocaleString() : "Never"}`,
+    );
     console.log(`${c}└─${r}`);
   }
 
@@ -413,6 +446,28 @@ function renderUsage(watch: boolean) {
       `  Updated: ${new Date().toLocaleTimeString()}  │  Ctrl+C to exit`,
     );
   }
+
+  // Tips
+  console.log("  💡 Tips:");
+  if (accounts.length > 1) {
+    const primary = accounts[0];
+    const primaryUsage = state.usage?.[primary.name];
+    const t = normalizeThresholds(config.threshold, DEFAULTS.threshold);
+    if (
+      primaryUsage &&
+      (primaryUsage.session5h?.utilization || 0) > t.session5h * 0.9
+    ) {
+      console.log(
+        `  • Primary account (${primary.name}) approaching threshold`,
+      );
+      console.log("    Consider: bun src/cli.ts config --threshold 0.80");
+    }
+  }
+  console.log(
+    "  • Run `bun src/cli.ts config --help` for configuration options",
+  );
+  console.log("  • Run `bun src/cli.ts list` for account overview");
+  console.log();
 }
 
 function cmdUsage(args: string[]) {
@@ -1673,7 +1728,7 @@ const rootCommand = Command.make("anthropic-multi-account", {}).pipe(
 
 const cli = Command.run(rootCommand, {
   name: "anthropic-multi-account",
-  version: "1.0.5",
+  version: "1.1.0",
 });
 
 cli(process.argv).pipe(Effect.provide(BunContext.layer), BunRuntime.runMain);
