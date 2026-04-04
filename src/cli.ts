@@ -747,14 +747,19 @@ async function refreshToken(account: any): Promise<string | null> {
   if (account.access && account.expires > Date.now()) return null;
   if (!account.refresh) return "No refresh token available";
   try {
-    const res = await fetch(
-      TOKEN_URL,
-      createOAuthTokenRequestInit({
+    const res = await fetch(TOKEN_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json, text/plain, */*",
+        "User-Agent": "axios/1.13.6",
+      },
+      body: JSON.stringify({
         grant_type: "refresh_token",
         refresh_token: account.refresh,
         client_id: CLIENT_ID,
       }),
-    );
+    });
     if (!res.ok) {
       const body = await res.text().catch(() => "");
       return `Token refresh failed (${res.status}): ${body.slice(0, 200)}`;

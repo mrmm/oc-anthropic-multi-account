@@ -590,37 +590,76 @@ function selectThresholdAccount(accounts, state) {
   }
 }
 
+let refreshPromise = null;
+
 async function ensureFreshAccountToken(account, multiAuth) {
   if (account.access && account.expires > Date.now()) {
     return { ok: true };
   }
 
-  const response = await fetch(
-    TOKEN_URL,
-    createOAuthTokenRequestInit({
-      grant_type: "refresh_token",
-      refresh_token: account.refresh,
-      client_id: CLIENT_ID,
-    }),
-  );
+  // Shared inflight refresh promise - prevents concurrent refreshes
+  if (!refreshPromise) {
+    refreshPromise = (async () => {
+      const maxRetries = 2;
+      const baseDelayMs = 500;
 
-  if (!response.ok) {
-    return {
-      ok: false,
-      status: response.status,
-    };
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+          if (attempt > 0) {
+            const delay = baseDelayMs * Math.pow(2, attempt - 1);
+            await new Promise((resolve) => setTimeout(resolve, delay));
+          }
+
+          const response = await fetch(TOKEN_URL, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Accept: "application/json, text/plain, */*",
+              "User-Agent": "axios/1.13.6",
+            },
+            body: JSON.stringify({
+              grant_type: "refresh_token",
+              refresh_token: account.refresh,
+              client_id: CLIENT_ID,
+            }),
+          });
+
+          if (!response.ok) {
+            if (response.status >= 500 && attempt < maxRetries) {
+              await response.body?.cancel();
+              continue;
+            }
+            return { ok: false, status: response.status };
+          }
+
+          const json = await response.json();
+          account.access = json.access_token;
+          account.refresh = json.refresh_token;
+          account.expires = Date.now() + json.expires_in * 1000;
+
+          // Persist updated tokens
+          const idx = multiAuth.accounts.findIndex(
+            (a) => a.name === account.name,
+          );
+          if (idx >= 0) {
+            multiAuth.accounts[idx] = account;
+            saveMultiAuth(multiAuth);
+          }
+
+          return { ok: true };
+        } catch (error) {
+          if (isNetworkError(error) && attempt < maxRetries) {
+            continue;
+          }
+          throw error;
+        }
+      }
+    })().finally(() => {
+      refreshPromise = null;
+    });
   }
 
-  const json = await response.json();
-  account.access = json.access_token;
-  account.refresh = json.refresh_token;
-  account.expires = Date.now() + json.expires_in * 1000;
-  account.accessToken = account.access;
-  account.refreshToken = account.refresh;
-  account.expiresAt = account.expires;
-
-  saveMultiAuth(multiAuth);
-
+  await refreshPromise;
   return { ok: true };
 }
 
