@@ -717,6 +717,126 @@ function setOAuthHeaders(headers, accessToken) {
   return headers;
 }
 
+// ---------------------------------------------------------------------------
+// Tool name transformation
+// ---------------------------------------------------------------------------
+
+function prefixToolNames(bodyString) {
+  try {
+    const parsed = JSON.parse(bodyString);
+
+    // Sanitize system prompt - server blocks "OpenCode" string
+    if (parsed.system && Array.isArray(parsed.system)) {
+      parsed.system = parsed.system.map((item) => {
+        if (item.type === "text" && item.text) {
+          return {
+            ...item,
+            text: item.text
+              .replace(/OpenCode/g, "Claude Code")
+              .replace(/opencode/gi, "Claude"),
+          };
+        }
+        return item;
+      });
+    }
+
+    // Add prefix to tools definitions
+    if (parsed.tools && Array.isArray(parsed.tools)) {
+      parsed.tools = parsed.tools.map((tool) => ({
+        ...tool,
+        name: tool.name ? `${TOOL_PREFIX}${tool.name}` : tool.name,
+      }));
+    }
+
+    // Add prefix to tool_use blocks in messages
+    if (parsed.messages && Array.isArray(parsed.messages)) {
+      parsed.messages = parsed.messages.map((msg) => {
+        if (msg.content && Array.isArray(msg.content)) {
+          msg.content = msg.content.map((block) => {
+            if (block.type === "tool_use" && block.name) {
+              return {
+                ...block,
+                name: `${TOOL_PREFIX}${block.name}`,
+              };
+            }
+            return block;
+          });
+        }
+        return msg;
+      });
+    }
+
+    return JSON.stringify(parsed);
+  } catch (e) {
+    // ignore parse errors, return original
+    return bodyString;
+  }
+}
+
+function stripToolPrefix(text) {
+  return text.replace(/"name"\s*:\s*"mcp_([^"]+)"/g, '"name": "$1"');
+}
+
+function createStrippedStream(response) {
+  if (!response.body) return response;
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+
+  return new Response(
+    new ReadableStream({
+      async pull(controller) {
+        const { done, value } = await reader.read();
+        if (done) {
+          controller.close();
+          return;
+        }
+        let text = decoder.decode(value, { stream: true });
+        text = stripToolPrefix(text);
+        controller.enqueue(encoder.encode(text));
+      },
+    }),
+    {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// URL rewriting
+// ---------------------------------------------------------------------------
+
+function rewriteUrl(input) {
+  let requestUrl = null;
+  try {
+    if (typeof input === "string" || input instanceof URL) {
+      requestUrl = new URL(input.toString());
+    } else if (input instanceof Request) {
+      requestUrl = new URL(input.url);
+    }
+  } catch {
+    requestUrl = null;
+  }
+
+  if (
+    requestUrl &&
+    requestUrl.pathname === "/v1/messages" &&
+    !requestUrl.searchParams.has("beta")
+  ) {
+    requestUrl.searchParams.set("beta", "true");
+    const rewrittenInput =
+      input instanceof Request
+        ? new Request(requestUrl.toString(), input)
+        : requestUrl;
+    return { input: rewrittenInput };
+  }
+
+  return { input };
+}
+
 /**
  * @type {import('@opencode-ai/plugin').Plugin}
  */
@@ -818,79 +938,10 @@ export async function AnthropicAuthPlugin({ client }) {
 
               let body = requestInit.body;
               if (body && typeof body === "string") {
-                try {
-                  const parsed = JSON.parse(body);
-
-                  // Sanitize system prompt - server blocks "OpenCode" string
-                  if (parsed.system && Array.isArray(parsed.system)) {
-                    parsed.system = parsed.system.map((item) => {
-                      if (item.type === "text" && item.text) {
-                        return {
-                          ...item,
-                          text: item.text
-                            .replace(/OpenCode/g, "Claude Code")
-                            .replace(/opencode/gi, "Claude"),
-                        };
-                      }
-                      return item;
-                    });
-                  }
-
-                  // Add prefix to tools definitions
-                  if (parsed.tools && Array.isArray(parsed.tools)) {
-                    parsed.tools = parsed.tools.map((tool) => ({
-                      ...tool,
-                      name: tool.name
-                        ? `${TOOL_PREFIX}${tool.name}`
-                        : tool.name,
-                    }));
-                  }
-                  // Add prefix to tool_use blocks in messages
-                  if (parsed.messages && Array.isArray(parsed.messages)) {
-                    parsed.messages = parsed.messages.map((msg) => {
-                      if (msg.content && Array.isArray(msg.content)) {
-                        msg.content = msg.content.map((block) => {
-                          if (block.type === "tool_use" && block.name) {
-                            return {
-                              ...block,
-                              name: `${TOOL_PREFIX}${block.name}`,
-                            };
-                          }
-                          return block;
-                        });
-                      }
-                      return msg;
-                    });
-                  }
-                  body = JSON.stringify(parsed);
-                } catch (e) {
-                  // ignore parse errors
-                }
+                body = prefixToolNames(body);
               }
 
-              let requestInput = input;
-              let requestUrl = null;
-              try {
-                if (typeof input === "string" || input instanceof URL) {
-                  requestUrl = new URL(input.toString());
-                } else if (input instanceof Request) {
-                  requestUrl = new URL(input.url);
-                }
-              } catch {
-                requestUrl = null;
-              }
-
-              if (
-                requestUrl &&
-                requestUrl.pathname === "/v1/messages" &&
-                !requestUrl.searchParams.has("beta")
-              ) {
-                requestUrl.searchParams.set("beta", "true");
-                requestInput =
-                  input instanceof Request
-                    ? new Request(requestUrl.toString(), input)
-                    : requestUrl;
-              }
+              const { input: requestInput } = rewriteUrl(input);
 
               function isScopeFailureResponse(responseBody, status) {
                 if (status !== 401 && status !== 403) return false;
@@ -997,37 +1048,8 @@ export async function AnthropicAuthPlugin({ client }) {
               // Save state (usage, currentAccount, requestCount)
               saveState(state);
 
-              // Transform streaming response to rename tools back
-              if (response.body) {
-                const reader = response.body.getReader();
-                const decoder = new TextDecoder();
-                const encoder = new TextEncoder();
-
-                const stream = new ReadableStream({
-                  async pull(controller) {
-                    const { done, value } = await reader.read();
-                    if (done) {
-                      controller.close();
-                      return;
-                    }
-
-                    let text = decoder.decode(value, { stream: true });
-                    text = text.replace(
-                      /"name"\s*:\s*"mcp_([^"]+)"/g,
-                      '"name": "$1"',
-                    );
-                    controller.enqueue(encoder.encode(text));
-                  },
-                });
-
-                return new Response(stream, {
-                  status: response.status,
-                  statusText: response.statusText,
-                  headers: response.headers,
-                });
-              }
-
-              return response;
+              // Transform streaming response to strip tool prefixes
+              return createStrippedStream(response);
             },
           };
         }
@@ -1086,79 +1108,10 @@ export async function AnthropicAuthPlugin({ client }) {
 
               let body = requestInit.body;
               if (body && typeof body === "string") {
-                try {
-                  const parsed = JSON.parse(body);
-
-                  // Sanitize system prompt - server blocks "OpenCode" string
-                  if (parsed.system && Array.isArray(parsed.system)) {
-                    parsed.system = parsed.system.map((item) => {
-                      if (item.type === "text" && item.text) {
-                        return {
-                          ...item,
-                          text: item.text
-                            .replace(/OpenCode/g, "Claude Code")
-                            .replace(/opencode/gi, "Claude"),
-                        };
-                      }
-                      return item;
-                    });
-                  }
-
-                  // Add prefix to tools definitions
-                  if (parsed.tools && Array.isArray(parsed.tools)) {
-                    parsed.tools = parsed.tools.map((tool) => ({
-                      ...tool,
-                      name: tool.name
-                        ? `${TOOL_PREFIX}${tool.name}`
-                        : tool.name,
-                    }));
-                  }
-                  // Add prefix to tool_use blocks in messages
-                  if (parsed.messages && Array.isArray(parsed.messages)) {
-                    parsed.messages = parsed.messages.map((msg) => {
-                      if (msg.content && Array.isArray(msg.content)) {
-                        msg.content = msg.content.map((block) => {
-                          if (block.type === "tool_use" && block.name) {
-                            return {
-                              ...block,
-                              name: `${TOOL_PREFIX}${block.name}`,
-                            };
-                          }
-                          return block;
-                        });
-                      }
-                      return msg;
-                    });
-                  }
-                  body = JSON.stringify(parsed);
-                } catch (e) {
-                  // ignore parse errors
-                }
+                body = prefixToolNames(body);
               }
 
-              let requestInput = input;
-              let requestUrl = null;
-              try {
-                if (typeof input === "string" || input instanceof URL) {
-                  requestUrl = new URL(input.toString());
-                } else if (input instanceof Request) {
-                  requestUrl = new URL(input.url);
-                }
-              } catch {
-                requestUrl = null;
-              }
-
-              if (
-                requestUrl &&
-                requestUrl.pathname === "/v1/messages" &&
-                !requestUrl.searchParams.has("beta")
-              ) {
-                requestUrl.searchParams.set("beta", "true");
-                requestInput =
-                  input instanceof Request
-                    ? new Request(requestUrl.toString(), input)
-                    : requestUrl;
-              }
+              const { input: requestInput } = rewriteUrl(input);
 
               const response = await fetch(requestInput, {
                 ...requestInit,
@@ -1166,37 +1119,8 @@ export async function AnthropicAuthPlugin({ client }) {
                 headers: requestHeaders,
               });
 
-              // Transform streaming response to rename tools back
-              if (response.body) {
-                const reader = response.body.getReader();
-                const decoder = new TextDecoder();
-                const encoder = new TextEncoder();
-
-                const stream = new ReadableStream({
-                  async pull(controller) {
-                    const { done, value } = await reader.read();
-                    if (done) {
-                      controller.close();
-                      return;
-                    }
-
-                    let text = decoder.decode(value, { stream: true });
-                    text = text.replace(
-                      /"name"\s*:\s*"mcp_([^"]+)"/g,
-                      '"name": "$1"',
-                    );
-                    controller.enqueue(encoder.encode(text));
-                  },
-                });
-
-                return new Response(stream, {
-                  status: response.status,
-                  statusText: response.statusText,
-                  headers: response.headers,
-                });
-              }
-
-              return response;
+              // Transform streaming response to strip tool prefixes
+              return createStrippedStream(response);
             },
           };
         }
