@@ -1155,8 +1155,9 @@ export async function AnthropicAuthPlugin({ client }) {
               callback: async (code) => {
                 const credentials = await exchange(code, result.verifier, result.redirectUri, result.state);
                 if (credentials.type === "failed") return credentials;
-                const result = await fetch(
-                  `https://api.anthropic.com/api/oauth/claude_cli/create_api_key`,
+
+                const apiKey = await fetch(
+                  "https://api.anthropic.com/api/oauth/claude_cli/create_api_key",
                   {
                     method: "POST",
                     headers: {
@@ -1165,7 +1166,8 @@ export async function AnthropicAuthPlugin({ client }) {
                     },
                   },
                 ).then((r) => r.json());
-                return { type: "success", key: result.raw_key };
+
+                return { type: "success", key: apiKey.raw_key };
               },
             };
           },
