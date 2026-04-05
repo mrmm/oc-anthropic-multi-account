@@ -8,6 +8,8 @@ import {
   copyFileSync,
   renameSync,
   mkdirSync,
+  statSync,
+  readdirSync,
 } from "fs";
 import { homedir } from "os";
 import { dirname, join } from "path";
@@ -740,8 +742,58 @@ function renderCompactUsage(
 
 function cmdUsage(args: string[]) {
   const watch = args.includes("--watch") || args.includes("-w");
+  const json = args.includes("--json") || args.includes("-j");
+
+  if (json) {
+    renderUsageJson();
+    return;
+  }
+
   renderUsage(watch);
   if (watch) setInterval(() => renderUsage(true), 5000);
+}
+
+function renderUsageJson() {
+  const data = loadData();
+  const accounts = data.accounts || [];
+
+  const accountsChanged = ensureAllAccountsInState(accounts, data);
+  const staleResolved = resolveStaleMetrics(data);
+  if (accountsChanged || staleResolved) {
+    autoEvaluate(data);
+    saveData(data);
+  }
+
+  const result = {
+    version: "1.0",
+    activeAccount: data.currentAccount || accounts[0]?.name || null,
+    accounts: accounts.map((account: any) => {
+      const isActive = data.currentAccount === account.name;
+      const usage = data.usage?.[account.name] || {};
+      return {
+        name: account.name,
+        active: isActive,
+        utilization: {
+          session5h: usage.session5h?.utilization || 0,
+          weekly7d: usage.weekly7d?.utilization || 0,
+          weekly7dSonnet: usage.weekly7dSonnet?.utilization || 0,
+        },
+        status: {
+          session5h: usage.session5h?.status || "unknown",
+          weekly7d: usage.weekly7d?.status || "unknown",
+          weekly7dSonnet: usage.weekly7dSonnet?.status || "unknown",
+        },
+        reset: {
+          session5h: usage.session5h?.reset || null,
+          weekly7d: usage.weekly7d?.reset || null,
+          weekly7dSonnet: usage.weekly7dSonnet?.reset || null,
+        },
+      };
+    }),
+    requestCount: data.requestCount || 0,
+  };
+
+  console.log(JSON.stringify(result));
 }
 
 // ============================================================================
@@ -1001,6 +1053,7 @@ function cmdConfig(args: string[]) {
     console.log(
       `    Check interval:    ${(cfg.checkInterval ?? DEFAULTS.checkInterval) / 60000} min`,
     );
+    console.log(`    Switch mode:       ${cfg.switchMode || "auto"}`);
 
     // Show per-account overrides if any exist
     const accountOverrides = cfg.accounts;
@@ -1129,6 +1182,17 @@ function cmdConfig(args: string[]) {
     changed = true;
   }
 
+  // Switch mode: auto or manual
+  const sm = parseArg("--switch-mode");
+  if (sm) {
+    if (sm !== "auto" && sm !== "manual") {
+      console.log("\n  ❌ --switch-mode must be 'auto' or 'manual'");
+      return;
+    }
+    data.config.switchMode = sm;
+    changed = true;
+  }
+
   // Clean up legacy recover config
   delete data.config.recover;
 
@@ -1140,11 +1204,36 @@ function cmdConfig(args: string[]) {
   }
 }
 
+function logSwitch(data: any, from: string, to: string, reason: string) {
+  if (!data.switchHistory) data.switchHistory = [];
+  data.switchHistory.push({
+    ts: new Date().toISOString(),
+    from,
+    to,
+    reason,
+  });
+  // Keep last 50 entries
+  if (data.switchHistory.length > 50) {
+    data.switchHistory = data.switchHistory.slice(-50);
+  }
+}
+
 function autoEvaluate(data: any) {
   const accounts = data.accounts || [];
   if (accounts.length < 2 || !data.currentAccount) return;
 
   const config = data.config || {};
+
+  // Manual mode: skip auto-evaluation entirely
+  if (config.switchMode === "manual") return;
+  const LOG_FILE = "/tmp/sketchybar_logs.txt";
+
+  function aeLog(msg: string) {
+    try {
+      const ts = new Date().toISOString().replace("T", " ").slice(0, 19);
+      require("fs").appendFileSync(LOG_FILE, `${ts} [autoEvaluate] ${msg}\n`);
+    } catch {}
+  }
 
   function isOverThreshold(accountName: string, usage: any): boolean {
     if (!usage) return false;
@@ -1156,27 +1245,111 @@ function autoEvaluate(data: any) {
     );
   }
 
+  function isRejected(usage: any): boolean {
+    if (!usage) return false;
+    return (
+      usage.session5h?.status === "rejected" ||
+      usage.weekly7d?.status === "rejected"
+    );
+  }
+
+  function maxUtil(usage: any): number {
+    if (!usage) return 0;
+    return Math.max(
+      usage.session5h?.utilization || 0,
+      usage.weekly7d?.utilization || 0,
+    );
+  }
+
   const primary = accounts[0];
   const currentAccount = data.currentAccount;
   const primaryUsage = data.usage?.[primary.name];
+  const currentUsage = data.usage?.[currentAccount];
+
+  aeLog(`Evaluating: current=${currentAccount}, primary=${primary.name}`);
+  for (const acct of accounts) {
+    const u = data.usage?.[acct.name];
+    const t = getAccountThresholds(acct.name, config);
+    aeLog(
+      `  ${acct.name}: s5h=${((u?.session5h?.utilization || 0) * 100).toFixed(0)}% (${u?.session5h?.status || "?"}), ` +
+        `w7d=${((u?.weekly7d?.utilization || 0) * 100).toFixed(0)}% (${u?.weekly7d?.status || "?"}), ` +
+        `overThreshold=${isOverThreshold(acct.name, u)}, rejected=${isRejected(u)}, ` +
+        `thresholds=[s5h:${t.session5h}, w7d:${t.weekly7d}]`,
+    );
+  }
 
   if (currentAccount === primary.name) {
+    // On primary: switch to fallback only if fallback is actually better
     if (isOverThreshold(primary.name, primaryUsage)) {
       for (const fallback of accounts.slice(1)) {
-        if (!isOverThreshold(fallback.name, data.usage?.[fallback.name])) {
-          data.currentAccount = fallback.name;
-          console.log(
-            `  ⚡ Auto-switch: ${primary.name} → ${fallback.name} (threshold exceeded)`,
-          );
-          return;
+        const fallbackUsage = data.usage?.[fallback.name];
+        // Skip fallbacks that are rejected or have higher utilization
+        if (isRejected(fallbackUsage)) {
+          aeLog(`  Skip ${fallback.name}: rejected`);
+          continue;
         }
+        if (isOverThreshold(fallback.name, fallbackUsage)) {
+          aeLog(`  Skip ${fallback.name}: also over threshold`);
+          continue;
+        }
+        if (maxUtil(fallbackUsage) >= maxUtil(primaryUsage)) {
+          aeLog(
+            `  Skip ${fallback.name}: util ${(maxUtil(fallbackUsage) * 100).toFixed(0)}% >= primary ${(maxUtil(primaryUsage) * 100).toFixed(0)}%`,
+          );
+          continue;
+        }
+        data.currentAccount = fallback.name;
+        logSwitch(
+          data,
+          primary.name,
+          fallback.name,
+          "threshold exceeded, fallback available",
+        );
+        aeLog(
+          `  SWITCH: ${primary.name} → ${fallback.name} (fallback is better)`,
+        );
+        console.log(
+          `  ⚡ Auto-switch: ${primary.name} → ${fallback.name} (threshold exceeded, fallback available)`,
+        );
+        return;
       }
+      aeLog(`  STAY on ${primary.name}: no better fallback available`);
+    } else {
+      aeLog(`  STAY on ${primary.name}: under threshold`);
     }
   } else {
-    if (!isOverThreshold(primary.name, primaryUsage)) {
+    // On fallback: switch back to primary only if primary is actually better
+    const currentRejected = isRejected(currentUsage);
+    const primaryRejected = isRejected(primaryUsage);
+    const primaryUnderThreshold = !isOverThreshold(primary.name, primaryUsage);
+    const primaryBetterUtil = maxUtil(primaryUsage) < maxUtil(currentUsage);
+
+    if (primaryUnderThreshold && !primaryRejected) {
       data.currentAccount = primary.name;
+      logSwitch(data, currentAccount, primary.name, "primary under threshold");
+      aeLog(
+        `  SWITCH: ${currentAccount} → ${primary.name} (primary under threshold)`,
+      );
       console.log(
         `  ⚡ Auto-switch: ${currentAccount} → ${primary.name} (primary under threshold)`,
+      );
+    } else if (currentRejected && !primaryRejected && primaryBetterUtil) {
+      data.currentAccount = primary.name;
+      logSwitch(
+        data,
+        currentAccount,
+        primary.name,
+        "current rejected, primary better",
+      );
+      aeLog(
+        `  SWITCH: ${currentAccount} → ${primary.name} (current rejected, primary better)`,
+      );
+      console.log(
+        `  ⚡ Auto-switch: ${currentAccount} → ${primary.name} (current rejected, primary available)`,
+      );
+    } else {
+      aeLog(
+        `  STAY on ${currentAccount}: primary not better (overThresh=${!primaryUnderThreshold}, rejected=${primaryRejected})`,
       );
     }
   }
@@ -1801,6 +1974,7 @@ async function cmdRefresh(accountName?: string) {
     }
   }
 
+  autoEvaluate(data);
   saveData(data);
   console.log("  ✅ Usage data refreshed\n");
 }
@@ -3017,6 +3191,465 @@ function cmdSwitch(name: string) {
 // Help
 // ============================================================================
 
+// ============================================================================
+// Request history log
+// ============================================================================
+
+const LOGS_DIR = join(CONFIG_DIR, "anthropic-multi-account-logs");
+const LEGACY_LOG_FILE = join(
+  CONFIG_DIR,
+  "anthropic-multi-account-requests.jsonl",
+);
+
+interface RequestLogEntry {
+  v?: number;
+  timestamp: string;
+  account: string;
+  model: string;
+  tokens: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    reasoning: number;
+    total: number;
+  };
+  cost: number;
+  durationMs: number;
+  statusCode: number;
+  stopReason?: string | null;
+  requestId?: string | null;
+  switched: boolean;
+  switchReason: string | null;
+  extraCredit: boolean;
+  request?: {
+    requestModel?: string;
+    maxTokens?: number;
+    temperature?: number;
+    messageCount?: number;
+    userMessages?: number;
+    assistantMessages?: number;
+    toolUseCalls?: number;
+    toolResultCalls?: number;
+    toolDefinitions?: number;
+    systemPromptParts?: number;
+    systemPromptChars?: number;
+    thinking?: { type: string; budgetTokens?: number };
+  };
+  rateLimits?: {
+    session5h: number | null;
+    weekly7d: number | null;
+    weekly7dSonnet: number | null;
+  };
+  context: {
+    directory: string | null;
+    worktree: string | null;
+    repoName?: string | null;
+  };
+}
+
+function listLogFiles(): string[] {
+  if (!existsSync(LOGS_DIR)) return [];
+  return readdirSync(LOGS_DIR)
+    .filter((f) => f.endsWith(".jsonl") || f.endsWith(".jsonl.gz"))
+    .sort(); // chronological order (YYYY-MM.jsonl)
+}
+
+function readLogFile(filePath: string): string {
+  if (filePath.endsWith(".gz")) {
+    try {
+      return execSync(`gzip -dc "${filePath}"`, {
+        maxBuffer: 100 * 1024 * 1024,
+      }).toString("utf8");
+    } catch {
+      return "";
+    }
+  }
+  return readFileSync(filePath, "utf8");
+}
+
+function readRequestLog(
+  limit: number = 50,
+  filter?: {
+    account?: string;
+    model?: string;
+    directory?: string;
+    month?: string;
+    since?: string;
+  },
+): RequestLogEntry[] {
+  const files = listLogFiles();
+  // Also check legacy file
+  const allFiles: string[] = [];
+  if (existsSync(LEGACY_LOG_FILE)) allFiles.push(LEGACY_LOG_FILE);
+  for (const f of files) {
+    const month = f.replace(".jsonl.gz", "").replace(".jsonl", "");
+    if (filter?.month && !month.startsWith(filter.month)) continue;
+    allFiles.push(join(LOGS_DIR, f));
+  }
+
+  let entries: RequestLogEntry[] = [];
+  for (const file of allFiles) {
+    const content = readLogFile(file);
+    const lines = content.trim().split("\n").filter(Boolean);
+    for (const line of lines) {
+      try {
+        entries.push(JSON.parse(line));
+      } catch {}
+    }
+  }
+
+  // Apply filters
+  if (filter?.account) {
+    entries = entries.filter((e) => e.account === filter.account);
+  }
+  if (filter?.model) {
+    entries = entries.filter((e) =>
+      e.model?.toLowerCase().includes(filter.model!.toLowerCase()),
+    );
+  }
+  if (filter?.directory) {
+    entries = entries.filter(
+      (e) =>
+        e.context?.directory?.includes(filter.directory!) ||
+        e.context?.worktree?.includes(filter.directory!) ||
+        e.context?.repoName?.includes(filter.directory!),
+    );
+  }
+  if (filter?.since) {
+    entries = entries.filter((e) => e.timestamp >= filter.since!);
+  }
+  // Sort by timestamp
+  entries.sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+  // Return last N entries (most recent)
+  return entries.slice(-limit);
+}
+
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${(ms / 60000).toFixed(1)}m`;
+}
+
+function formatTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  return String(n);
+}
+
+function cmdRequests(args: string[] = []) {
+  const limit =
+    parseInt(args.find((a) => a.startsWith("--limit="))?.split("=")[1] || "") ||
+    50;
+  const accountFilter = args
+    .find((a) => a.startsWith("--account="))
+    ?.split("=")[1];
+  const modelFilter = args.find((a) => a.startsWith("--model="))?.split("=")[1];
+  const dirFilter = args.find((a) => a.startsWith("--dir="))?.split("=")[1];
+  const monthFilter = args.find((a) => a.startsWith("--month="))?.split("=")[1];
+  const sinceFilter = args.find((a) => a.startsWith("--since="))?.split("=")[1];
+  const showSummary = args.includes("--summary");
+  const showJson = args.includes("--json");
+  const showFiles = args.includes("--files");
+
+  // Show available log files
+  if (showFiles) {
+    const files = listLogFiles();
+    if (files.length === 0) {
+      console.log(`\n  No log files found in ${LOGS_DIR}\n`);
+      return;
+    }
+    console.log(`\n  📁 Log files in ${LOGS_DIR}\n`);
+    for (const f of files) {
+      const fullPath = join(LOGS_DIR, f);
+      try {
+        const stat = statSync(fullPath);
+        const size =
+          stat.size > 1024 * 1024
+            ? `${(stat.size / 1024 / 1024).toFixed(1)}MB`
+            : stat.size > 1024
+              ? `${(stat.size / 1024).toFixed(0)}KB`
+              : `${stat.size}B`;
+        const gz = f.endsWith(".gz") ? " (compressed)" : "";
+        console.log(`    ${f}  ${size}${gz}`);
+      } catch {}
+    }
+    if (existsSync(LEGACY_LOG_FILE)) {
+      console.log(`    [legacy] ${LEGACY_LOG_FILE}`);
+    }
+    console.log();
+    return;
+  }
+
+  const entries = readRequestLog(showSummary ? 100000 : limit, {
+    account: accountFilter,
+    model: modelFilter,
+    directory: dirFilter,
+    month: monthFilter,
+    since: sinceFilter,
+  });
+
+  if (entries.length === 0) {
+    console.log(`\n  No request history found.`);
+    console.log(
+      `  Requests are logged after using OpenCode with the multi-account plugin.\n`,
+    );
+    return;
+  }
+
+  if (showJson) {
+    console.log(JSON.stringify(entries, null, 2));
+    return;
+  }
+
+  if (showSummary) {
+    // Aggregate stats
+    const byAccount: Record<
+      string,
+      {
+        reqs: number;
+        input: number;
+        output: number;
+        cacheRead: number;
+        cacheWrite: number;
+        cost: number;
+        totalMs: number;
+      }
+    > = {};
+    const byModel: Record<
+      string,
+      { reqs: number; input: number; output: number; cost: number }
+    > = {};
+    const byDir: Record<
+      string,
+      { reqs: number; input: number; output: number; cost: number }
+    > = {};
+    let totalSwitches = 0;
+    let totalExtraCredit = 0;
+
+    for (const e of entries) {
+      // By account
+      const acc = (byAccount[e.account] ??= {
+        reqs: 0,
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        totalMs: 0,
+      });
+      acc.reqs++;
+      acc.input += e.tokens.input;
+      acc.output += e.tokens.output;
+      acc.cacheRead += e.tokens.cacheRead;
+      acc.cacheWrite += e.tokens.cacheWrite;
+      acc.cost += e.cost;
+      acc.totalMs += e.durationMs;
+
+      // By model
+      const mod = (byModel[e.model] ??= {
+        reqs: 0,
+        input: 0,
+        output: 0,
+        cost: 0,
+      });
+      mod.reqs++;
+      mod.input += e.tokens.input;
+      mod.output += e.tokens.output;
+      mod.cost += e.cost;
+
+      // By directory
+      const dirKey = e.context?.directory || "unknown";
+      const dir = (byDir[dirKey] ??= { reqs: 0, input: 0, output: 0, cost: 0 });
+      dir.reqs++;
+      dir.input += e.tokens.input;
+      dir.output += e.tokens.output;
+      dir.cost += e.cost;
+
+      if (e.switched) totalSwitches++;
+      if (e.extraCredit) totalExtraCredit++;
+    }
+
+    console.log(`\n  📊 Request Summary (${entries.length} requests)`);
+    console.log(`  ${"─".repeat(60)}\n`);
+
+    console.log(`  By Account:`);
+    for (const [name, s] of Object.entries(byAccount)) {
+      console.log(
+        `    ${name}: ${s.reqs} reqs | ${formatTokens(s.input)} in / ${formatTokens(s.output)} out | cache: ${formatTokens(s.cacheRead)} read / ${formatTokens(s.cacheWrite)} write | $${s.cost.toFixed(2)} | avg ${formatDuration(s.totalMs / s.reqs)}`,
+      );
+    }
+
+    console.log(`\n  By Model:`);
+    for (const [name, s] of Object.entries(byModel)) {
+      console.log(
+        `    ${name}: ${s.reqs} reqs | ${formatTokens(s.input)} in / ${formatTokens(s.output)} out | $${s.cost.toFixed(2)}`,
+      );
+    }
+
+    console.log(`\n  By Project:`);
+    // Build richer per-project stats
+    const byDirDetailed: Record<
+      string,
+      {
+        reqs: number;
+        input: number;
+        output: number;
+        cacheRead: number;
+        cacheWrite: number;
+        cost: number;
+        totalMs: number;
+        reasoning: number;
+        models: Record<
+          string,
+          { reqs: number; input: number; output: number; cost: number }
+        >;
+        accounts: Record<string, number>;
+        firstSeen: string;
+        lastSeen: string;
+      }
+    > = {};
+
+    for (const e of entries) {
+      const dirKey = e.context?.directory || "unknown";
+      const d = (byDirDetailed[dirKey] ??= {
+        reqs: 0,
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        cost: 0,
+        totalMs: 0,
+        reasoning: 0,
+        models: {},
+        accounts: {},
+        firstSeen: e.timestamp,
+        lastSeen: e.timestamp,
+      });
+      d.reqs++;
+      d.input += e.tokens.input;
+      d.output += e.tokens.output;
+      d.cacheRead += e.tokens.cacheRead;
+      d.cacheWrite += e.tokens.cacheWrite;
+      d.reasoning += e.tokens.reasoning;
+      d.cost += e.cost;
+      d.totalMs += e.durationMs;
+      if (e.timestamp < d.firstSeen) d.firstSeen = e.timestamp;
+      if (e.timestamp > d.lastSeen) d.lastSeen = e.timestamp;
+
+      const m = (d.models[e.model] ??= {
+        reqs: 0,
+        input: 0,
+        output: 0,
+        cost: 0,
+      });
+      m.reqs++;
+      m.input += e.tokens.input;
+      m.output += e.tokens.output;
+      m.cost += e.cost;
+
+      d.accounts[e.account] = (d.accounts[e.account] || 0) + 1;
+    }
+
+    // Sort by cost descending
+    const sortedDirs = Object.entries(byDirDetailed).sort(
+      (a, b) => b[1].cost - a[1].cost,
+    );
+    for (const [dir, d] of sortedDirs) {
+      const shortDir =
+        dir === "unknown" ? "unknown" : dir.replace(homedir(), "~");
+      const cacheHitRate =
+        d.input > 0
+          ? Math.round((d.cacheRead / (d.input + d.cacheRead)) * 100)
+          : 0;
+      const avgDur = formatDuration(d.totalMs / d.reqs);
+      console.log(`\n    📁 ${shortDir}`);
+      console.log(
+        `       ${d.reqs} requests | $${d.cost.toFixed(2)} total | avg ${avgDur}/req`,
+      );
+      console.log(
+        `       Tokens: ${formatTokens(d.input)} in / ${formatTokens(d.output)} out / ${formatTokens(d.reasoning)} reasoning`,
+      );
+      console.log(
+        `       Cache:  ${formatTokens(d.cacheRead)} read / ${formatTokens(d.cacheWrite)} write | hit rate: ${cacheHitRate}%`,
+      );
+      console.log(
+        `       Period: ${d.firstSeen.slice(0, 10)} → ${d.lastSeen.slice(0, 10)}`,
+      );
+      console.log(`       Models:`);
+      const sortedModels = Object.entries(d.models).sort(
+        (a, b) => b[1].cost - a[1].cost,
+      );
+      for (const [model, ms] of sortedModels) {
+        console.log(
+          `         ${model}: ${ms.reqs} reqs | ${formatTokens(ms.input)} in / ${formatTokens(ms.output)} out | $${ms.cost.toFixed(2)}`,
+        );
+      }
+      if (Object.keys(d.accounts).length > 1) {
+        console.log(
+          `       Accounts: ${Object.entries(d.accounts)
+            .map(([a, n]) => `${a}(${n})`)
+            .join(", ")}`,
+        );
+      }
+    }
+
+    console.log(
+      `\n  Switches: ${totalSwitches} | Extra credit requests: ${totalExtraCredit}`,
+    );
+    console.log();
+    return;
+  }
+
+  // Table view
+  console.log(`\n  📋 Request History (last ${entries.length})`);
+  console.log(`  ${"─".repeat(120)}`);
+
+  // Header
+  const hdr = [
+    "Timestamp".padEnd(20),
+    "Account".padEnd(18),
+    "Model".padEnd(22),
+    "In".padStart(7),
+    "Out".padStart(7),
+    "Cache".padStart(7),
+    "Cost".padStart(7),
+    "Time".padStart(7),
+    "Info".padEnd(12),
+  ].join(" │ ");
+  console.log(`  ${hdr}`);
+  console.log(`  ${"─".repeat(120)}`);
+
+  for (const e of entries) {
+    const ts = e.timestamp.replace("T", " ").slice(0, 19);
+    const acc = e.account.slice(0, 17).padEnd(18);
+    const model = (e.model || "unknown").slice(0, 21).padEnd(22);
+    const inp = formatTokens(e.tokens.input).padStart(7);
+    const out = formatTokens(e.tokens.output).padStart(7);
+    const cache = formatTokens(e.tokens.cacheRead).padStart(7);
+    const cost = `$${e.cost.toFixed(2)}`.padStart(7);
+    const dur = formatDuration(e.durationMs).padStart(7);
+    const flags: string[] = [];
+    if (e.switched) flags.push("SW");
+    if (e.extraCredit) flags.push("EC");
+    if (e.statusCode !== 200) flags.push(`${e.statusCode}`);
+    const info = flags.join(",").padEnd(12) || "";
+
+    console.log(
+      `  ${ts} │ ${acc} │ ${model} │ ${inp} │ ${out} │ ${cache} │ ${cost} │ ${dur} │ ${info}`,
+    );
+  }
+  console.log(`  ${"─".repeat(120)}\n`);
+
+  // Summary line
+  const totalCost = entries.reduce((s, e) => s + e.cost, 0);
+  const totalIn = entries.reduce((s, e) => s + e.tokens.input, 0);
+  const totalOut = entries.reduce((s, e) => s + e.tokens.output, 0);
+  console.log(
+    `  Total: ${entries.length} requests | ${formatTokens(totalIn)} in / ${formatTokens(totalOut)} out | $${totalCost.toFixed(2)}\n`,
+  );
+}
+
 function showHelp() {
   console.log(`
   anthropic-multi-account v1.1.0
@@ -3040,6 +3673,16 @@ function showHelp() {
     costs [<name>]          Show token consumption and costs
     costs --session         Show current session only
     costs --reset           Reset consumption counters
+    requests, reqs, log     Show request history table
+    requests --summary      Aggregated stats by account/model/project
+    requests --files        List available monthly log files
+    requests --limit=100    Show last N requests (default 50)
+    requests --account=X    Filter by account name
+    requests --model=X      Filter by model name
+    requests --dir=X        Filter by project/repo directory
+    requests --month=YYYY-MM  Filter by month
+    requests --since=DATE   Filter since date (ISO format)
+    requests --json         Output raw JSON
     test <name>             Test account connectivity and quotas
     ping <name> [--json]    Ping account (human-readable, or JSON with --json)
     diagnose                Run system diagnostics
@@ -3082,6 +3725,154 @@ function showHelp() {
 }
 
 // ============================================================================
+// Sketchybar bar output (key=value, easily parsed by Lua)
+// ============================================================================
+
+function cmdBar() {
+  const data = loadData();
+  const usage = data.usage || {};
+  const accounts = data.accounts || [];
+  const current = data.currentAccount || "";
+
+  // Build scored list: lower score = better candidate
+  // Rejected sessions get a high penalty, then sort by max utilization
+  let best: any = null;
+  let bestScore = Infinity;
+
+  for (const acct of accounts) {
+    const name = acct.name;
+    const u = usage[name] || {};
+    const s5h = u.session5h || {};
+    const w7d = u.weekly7d || {};
+
+    const pctS = Math.round((s5h.utilization || 0) * 100);
+    const pctW = Math.round((w7d.utilization || 0) * 100);
+    const statusS = s5h.status || "unknown";
+    const statusW = w7d.status || "unknown";
+    const resetS = s5h.reset || 0;
+
+    const rejected = statusS === "rejected" || statusW === "rejected";
+    const score = (rejected ? 1000 : 0) + Math.max(pctS, pctW);
+
+    // Among ties, prefer current account (score - 0.5)
+    const tiebreak = name === current ? score - 0.5 : score;
+
+    if (tiebreak < bestScore) {
+      bestScore = tiebreak;
+      best = { name, pctS, pctW, resetS, rejected };
+    }
+  }
+
+  if (!best) {
+    console.log("name=none\ns5h=0\nw7d=0\nreset=0\ncolor=grey");
+    return;
+  }
+
+  // Compute countdown for session reset
+  let countdown = "";
+  if (best.pctS > 0 && best.resetS) {
+    const remain = best.resetS - Math.floor(Date.now() / 1000);
+    if (remain > 0) {
+      const hrs = Math.floor(remain / 3600);
+      const mins = Math.floor((remain % 3600) / 60);
+      const secs = remain % 60;
+      countdown = `${hrs}h${String(mins).padStart(2, "0")}m${String(secs).padStart(2, "0")}s`;
+    }
+  }
+
+  // Color: red if weekly rejected, otherwise based on session (5h) usage
+  let color: string;
+  if (best.rejected) {
+    color = "red";
+  } else if (best.pctS >= 80) {
+    color = "red";
+  } else if (best.pctS >= 50) {
+    color = "orange";
+  } else if (best.pctS > 0) {
+    color = "yellow";
+  } else {
+    color = "green";
+  }
+
+  console.log(`name=${best.name}`);
+  console.log(`s5h=${best.pctS}`);
+  console.log(`w7d=${best.pctW}`);
+  console.log(`reset=${countdown}`);
+  console.log(`color=${color}`);
+}
+
+// ============================================================================
+// Sketchybar bar-detail output (all accounts, key=value per account)
+// ============================================================================
+
+function cmdBarDetail() {
+  const data = loadData();
+  const usage = data.usage || {};
+  const accounts = data.accounts || [];
+  const current = data.currentAccount || "";
+  const now = Math.floor(Date.now() / 1000);
+
+  function colorFor(pctS: number, pctW: number): string {
+    const hi = Math.max(pctW, pctS);
+    if (hi >= 80) return "red";
+    if (hi >= 50) return "orange";
+    if (hi > 0) return "yellow";
+    return "green";
+  }
+
+  function countdown(resetTs: number): string {
+    if (!resetTs) return "";
+    const remain = resetTs - now;
+    if (remain <= 0) return "";
+    const days = Math.floor(remain / 86400);
+    const hrs = Math.floor((remain % 86400) / 3600);
+    const mins = Math.floor((remain % 3600) / 60);
+    const secs = remain % 60;
+    if (days > 0) {
+      return `${days}d ${hrs}h${String(mins).padStart(2, "0")}m`;
+    }
+    return `${hrs}h${String(mins).padStart(2, "0")}m${String(secs).padStart(2, "0")}s`;
+  }
+
+  const switchMode = data.config?.switchMode || "auto";
+  console.log(`count=${accounts.length}`);
+  console.log(`current=${current}`);
+  console.log(`switchMode=${switchMode}`);
+
+  for (let i = 0; i < accounts.length; i++) {
+    const acct = accounts[i];
+    const name = acct.name;
+    const u = usage[name] || {};
+    const s5h = u.session5h || {};
+    const w7d = u.weekly7d || {};
+    const snt = u.weekly7dSonnet || {};
+
+    const pctS = Math.round((s5h.utilization || 0) * 100);
+    const pctW = Math.round((w7d.utilization || 0) * 100);
+    const pctSnt = Math.round((snt.utilization || 0) * 100);
+    const statusS = s5h.status || "unknown";
+    const statusW = w7d.status || "unknown";
+    const resetS = countdown(s5h.reset || 0);
+    const resetW = countdown(w7d.reset || 0);
+    const active = name === current;
+    const role = i === 0 ? "primary" : "fallback";
+    const color = colorFor(pctS, pctW);
+
+    console.log(`${i}.name=${name}`);
+    console.log(`${i}.role=${role}`);
+    console.log(`${i}.active=${active}`);
+    console.log(`${i}.s5h=${pctS}`);
+    console.log(`${i}.s5h_status=${statusS}`);
+    console.log(`${i}.s5h_reset=${resetS}`);
+    console.log(`${i}.w7d=${pctW}`);
+    console.log(`${i}.w7d_status=${statusW}`);
+    console.log(`${i}.w7d_reset=${resetW}`);
+    console.log(`${i}.sonnet=${pctSnt}`);
+    console.log(`${i}.color=${color}`);
+  }
+}
+
+// ============================================================================
 // Main dispatcher
 // ============================================================================
 
@@ -3118,6 +3909,11 @@ async function main() {
     case "costs":
       cmdCosts(rest[0], rest);
       break;
+    case "requests":
+    case "reqs":
+    case "log":
+      cmdRequests(rest);
+      break;
     case "test":
       await cmdTest(rest[0]);
       break;
@@ -3134,6 +3930,12 @@ async function main() {
     case "remove":
     case "rm":
       cmdRemove(rest[0]);
+      break;
+    case "bar":
+      cmdBar();
+      break;
+    case "bar-detail":
+      cmdBarDetail();
       break;
     case "diagnose":
       cmdDiagnose();

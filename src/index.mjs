@@ -492,15 +492,269 @@ const EMPTY_USAGE = {
 const AUTH_FAILURE_COOLDOWN = 60 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
+// Toast + console status tracking
+// ---------------------------------------------------------------------------
+
+let _pluginClient = null;
+const _lastLoggedUtilization = {};
+const UTILIZATION_LOG_DELTA = 0.05; // Only log when utilization changes by >5%
+const AUTO_TOAST_INTERVAL = 5; // Show auto-toast every N requests
+
+function _showToast(title, message, variant = "info", duration = 5000) {
+  if (!_pluginClient?.tui?.showToast) return;
+  try {
+    _pluginClient.tui.showToast({ body: { title, message, variant, duration } });
+  } catch {
+    // Silently ignore toast failures
+  }
+}
+
+function _formatUtilization(usage) {
+  if (!usage) return "no data";
+  const s5h = Math.round((usage.session5h?.utilization || 0) * 100);
+  const w7d = Math.round((usage.weekly7d?.utilization || 0) * 100);
+  const son = Math.round((usage.weekly7dSonnet?.utilization || 0) * 100);
+  return `5h: ${s5h}% | 7d: ${w7d}% | sonnet: ${son}%`;
+}
+
+function _shouldLogUtilization(accountName, usage) {
+  const prev = _lastLoggedUtilization[accountName];
+  if (!prev) return true;
+  if (!usage) return false;
+  const delta = Math.abs((usage.session5h?.utilization || 0) - (prev.session5h || 0));
+  const delta7d = Math.abs((usage.weekly7d?.utilization || 0) - (prev.weekly7d || 0));
+  const deltaSon = Math.abs((usage.weekly7dSonnet?.utilization || 0) - (prev.weekly7dSonnet || 0));
+  return delta > UTILIZATION_LOG_DELTA || delta7d > UTILIZATION_LOG_DELTA || deltaSon > UTILIZATION_LOG_DELTA;
+}
+
+function _recordLoggedUtilization(accountName, usage) {
+  _lastLoggedUtilization[accountName] = {
+    session5h: usage?.session5h?.utilization || 0,
+    weekly7d: usage?.weekly7d?.utilization || 0,
+    weekly7dSonnet: usage?.weekly7dSonnet?.utilization || 0,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Request log for optimization analytics
+// Monthly JSONL files in dedicated folder: ~/.config/opencode/anthropic-multi-account-logs/
+// Format: YYYY-MM.jsonl (one line per request)
+// Old months auto-compressed to .jsonl.gz
+// ---------------------------------------------------------------------------
+
+import { execSync } from "child_process";
+import { appendFileSync, readdirSync, statSync, unlinkSync } from "fs";
+
+const LOGS_DIR = join(CONFIG_DIR, "anthropic-multi-account-logs");
+const LEGACY_LOG_FILE = join(CONFIG_DIR, "anthropic-multi-account-requests.jsonl");
+let _pluginDirectory = null;
+let _pluginWorktree = null;
+let _requestBodyMeta = null; // extracted from request body before fetch
+
+function _getMonthlyLogPath(date = new Date()) {
+  const yyyy = date.getFullYear();
+  const mm = String(date.getMonth() + 1).padStart(2, '0');
+  return join(LOGS_DIR, `${yyyy}-${mm}.jsonl`);
+}
+
+function _ensureLogsDir() {
+  if (!existsSync(LOGS_DIR)) {
+    mkdirSync(LOGS_DIR, { recursive: true });
+  }
+}
+
+function _migrateLegacyLog() {
+  if (!existsSync(LEGACY_LOG_FILE)) return;
+  try {
+    _ensureLogsDir();
+    const content = readFileSync(LEGACY_LOG_FILE, 'utf8');
+    const lines = content.trim().split('\n').filter(Boolean);
+    // Group by month
+    const byMonth = {};
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line);
+        const d = new Date(entry.timestamp);
+        const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+        (byMonth[key] ??= []).push(line);
+      } catch {}
+    }
+    for (const [month, monthLines] of Object.entries(byMonth)) {
+      const path = join(LOGS_DIR, `${month}.jsonl`);
+      const existing = existsSync(path) ? readFileSync(path, 'utf8') : '';
+      writeFileSync(path, existing + monthLines.join('\n') + '\n', 'utf8');
+    }
+    // Remove legacy file after migration
+    unlinkSync(LEGACY_LOG_FILE);
+    console.log(`[multi-account] Migrated request log to monthly files in ${LOGS_DIR}`);
+  } catch {}
+}
+
+function _compressOldMonths() {
+  try {
+    const currentMonth = _getMonthlyLogPath().split('/').pop().replace('.jsonl', '');
+    const files = readdirSync(LOGS_DIR).filter(f => f.endsWith('.jsonl'));
+    for (const file of files) {
+      const month = file.replace('.jsonl', '');
+      if (month < currentMonth) {
+        const fullPath = join(LOGS_DIR, file);
+        const gzPath = fullPath + '.gz';
+        if (!existsSync(gzPath)) {
+          try {
+            execSync(`gzip -k "${fullPath}"`, { timeout: 10000 });
+            unlinkSync(fullPath);
+          } catch {}
+        }
+      }
+    }
+  } catch {}
+}
+
+function _appendRequestLog(entry) {
+  try {
+    _ensureLogsDir();
+    _migrateLegacyLog();
+    const logPath = _getMonthlyLogPath();
+    appendFileSync(logPath, JSON.stringify(entry) + '\n', 'utf8');
+    // Compress old months in background (non-blocking)
+    setTimeout(() => _compressOldMonths(), 100);
+  } catch {
+    // Silently ignore log failures
+  }
+}
+
+function _extractRequestBodyMeta(body) {
+  if (!body || typeof body !== 'string') return {};
+  try {
+    const parsed = JSON.parse(body);
+    const meta = {};
+    meta.requestModel = parsed.model || null;
+    meta.maxTokens = parsed.max_tokens || null;
+    meta.temperature = parsed.temperature ?? null;
+    meta.topP = parsed.top_p ?? null;
+    meta.stream = parsed.stream ?? null;
+    // System prompt stats
+    if (parsed.system && Array.isArray(parsed.system)) {
+      meta.systemPromptParts = parsed.system.length;
+      meta.systemPromptChars = parsed.system.reduce((sum, p) => sum + (p.text?.length || 0), 0);
+    }
+    // Message stats
+    if (parsed.messages && Array.isArray(parsed.messages)) {
+      meta.messageCount = parsed.messages.length;
+      meta.userMessages = parsed.messages.filter(m => m.role === 'user').length;
+      meta.assistantMessages = parsed.messages.filter(m => m.role === 'assistant').length;
+      // Count tool_use and tool_result blocks
+      let toolUseCalls = 0;
+      let toolResultCalls = 0;
+      for (const msg of parsed.messages) {
+        if (msg.content && Array.isArray(msg.content)) {
+          for (const block of msg.content) {
+            if (block.type === 'tool_use') toolUseCalls++;
+            if (block.type === 'tool_result') toolResultCalls++;
+          }
+        }
+      }
+      meta.toolUseCalls = toolUseCalls;
+      meta.toolResultCalls = toolResultCalls;
+    }
+    // Tool definitions count
+    if (parsed.tools && Array.isArray(parsed.tools)) {
+      meta.toolDefinitions = parsed.tools.length;
+    }
+    // Thinking/extended thinking config
+    if (parsed.thinking) {
+      meta.thinking = { type: parsed.thinking.type, budgetTokens: parsed.thinking.budget_tokens || null };
+    }
+    return meta;
+  } catch {
+    return {};
+  }
+}
+
+function _logRequest({
+  account, model, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens,
+  reasoningTokens, cost, durationMs, statusCode, switched, switchReason, extraCredit,
+  stopReason, requestId, bodyMeta, rateLimits,
+}) {
+  _appendRequestLog({
+    v: 2, // schema version for future compatibility
+    timestamp: new Date().toISOString(),
+    account,
+    model,
+    tokens: {
+      input: inputTokens || 0,
+      output: outputTokens || 0,
+      cacheRead: cacheReadTokens || 0,
+      cacheWrite: cacheWriteTokens || 0,
+      reasoning: reasoningTokens || 0,
+      total: (inputTokens || 0) + (outputTokens || 0) + (cacheReadTokens || 0) + (cacheWriteTokens || 0) + (reasoningTokens || 0),
+    },
+    cost: cost || 0,
+    durationMs: durationMs || 0,
+    statusCode: statusCode || 200,
+    stopReason: stopReason || null,
+    requestId: requestId || null,
+    switched: switched || false,
+    switchReason: switchReason || null,
+    extraCredit: extraCredit || false,
+    request: bodyMeta || {},
+    rateLimits: rateLimits || null,
+    context: {
+      directory: _pluginDirectory || null,
+      worktree: _pluginWorktree || null,
+      repoName: _pluginDirectory ? _pluginDirectory.split('/').pop() : null,
+    },
+  });
+}
+
+function _formatUsageDashboard(data) {
+  const accounts = data?.accounts || [];
+  const lines = ["[multi-account] Account Usage Dashboard"];
+  for (const acc of accounts) {
+    const usage = data?.usage?.[acc.name];
+    const active = data?.currentAccount === acc.name ? " (active)" : "";
+    const extra = usage?.extraCredit?.detected ? " [EXTRA CREDIT]" : "";
+    lines.push(`  ${acc.name}${active}${extra}: ${_formatUtilization(usage)}`);
+    if (usage?.consumption?.currentSession) {
+      const cs = usage.consumption.currentSession;
+      lines.push(`    session: ${cs.requests} reqs, ${cs.input + cs.output} tokens, ~$${cs.estimatedCost}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
 // Token consumption tracking & extra credit detection
 // ---------------------------------------------------------------------------
 
 const MODEL_PRICING = {
-  // Per million tokens [input, output]
-  "haiku": [1.00, 5.00],
-  "sonnet": [3.00, 15.00],
-  "opus": [15.00, 75.00],
+  // Per million tokens [input, output, cache_read, cache_write]
+  "haiku": [1.00, 5.00, 0.10, 1.25],
+  "sonnet": [3.00, 15.00, 0.30, 3.75],
+  "opus": [15.00, 75.00, 1.50, 18.75],
 };
+
+// Anthropic cost rates per million tokens for OpenCode's native cost display
+const ANTHROPIC_MODEL_COSTS = {
+  "claude-haiku":       { input: 1.00, output: 5.00, cache: { read: 0.10, write: 1.25 } },
+  "claude-sonnet":      { input: 3.00, output: 15.00, cache: { read: 0.30, write: 3.75 } },
+  "claude-opus":        { input: 15.00, output: 75.00, cache: { read: 1.50, write: 18.75 } },
+};
+
+function setRealModelCosts(providerModels) {
+  for (const [modelId, model] of Object.entries(providerModels)) {
+    const id = modelId.toLowerCase();
+    let rates;
+    if (id.includes("haiku")) rates = ANTHROPIC_MODEL_COSTS["claude-haiku"];
+    else if (id.includes("opus")) rates = ANTHROPIC_MODEL_COSTS["claude-opus"];
+    else rates = ANTHROPIC_MODEL_COSTS["claude-sonnet"]; // default for sonnet and unknown
+    model.cost = {
+      input: rates.input,
+      output: rates.output,
+      cache: { read: rates.cache.read, write: rates.cache.write },
+    };
+  }
+}
 
 function getModelPricing(model) {
   const m = model.toLowerCase();
@@ -597,6 +851,12 @@ function ensureAllAccountsInState(accounts, state) {
   return changed;
 }
 
+function logSwitch(data, from, to, reason) {
+  if (!data.switchHistory) data.switchHistory = [];
+  data.switchHistory.push({ ts: new Date().toISOString(), from, to, reason });
+  if (data.switchHistory.length > 50) data.switchHistory = data.switchHistory.slice(-50);
+}
+
 function resolveStaleMetrics(state) {
   const usage = state.usage;
   if (!usage) return false;
@@ -634,6 +894,12 @@ function selectThresholdAccount(accounts, state) {
 
   if (!state || !state.currentAccount) {
     return primary;
+  }
+
+  // Manual mode: always return the currently set account, no auto-switching
+  if (config.switchMode === "manual") {
+    const current = accounts.find((a) => a.name === state.currentAccount);
+    return current || primary;
   }
 
   function isOverThreshold(accountName, usage) {
@@ -674,19 +940,33 @@ function selectThresholdAccount(accounts, state) {
     if (isOverThreshold(primary.name, primaryUsage)) {
       for (const fallback of fallbacks) {
         const fallbackUsage = state.usage?.[fallback.name];
-        if (!isOverThreshold(fallback.name, fallbackUsage) && !isTemporarilyUnavailable(fallback.name)) {
+        const fallbackRejected = fallbackUsage?.session5h?.status === "rejected" || fallbackUsage?.weekly7d?.status === "rejected";
+        if (!fallbackRejected && !isOverThreshold(fallback.name, fallbackUsage) && !isTemporarilyUnavailable(fallback.name)) {
           const exceeded = getExceededMetric(primary.name, primaryUsage);
-          console.log(`[multi-account] ${primary.name} → ${fallback.name}: ${exceeded.name} at ${Math.round(exceeded.value * 100)}% (threshold ${Math.round(exceeded.threshold * 100)}%)`);
+          const msg = `${primary.name} → ${fallback.name}: ${exceeded.name} at ${Math.round(exceeded.value * 100)}% (threshold ${Math.round(exceeded.threshold * 100)}%)`;
+          console.log(`[multi-account] ${msg}`);
+          _showToast("Account Switch", msg, "warning");
           return fallback;
         }
       }
+      // All fallbacks are also over threshold — only switch if one is actually better
       const availableFallbacks = fallbacks.filter((fallback) => !isTemporarilyUnavailable(fallback.name));
       const pool = availableFallbacks.length > 0 ? availableFallbacks : fallbacks;
       const best = pool.reduce((lowest, f) => {
         return getUtilizationScore(f.name, state.usage?.[f.name]) < getUtilizationScore(lowest.name, state.usage?.[lowest.name]) ? f : lowest;
       }, pool[0]);
+      const bestUsage = state.usage?.[best.name];
+      const bestRejected = bestUsage?.session5h?.status === "rejected" || bestUsage?.weekly7d?.status === "rejected";
+      const bestScore = getUtilizationScore(best.name, bestUsage);
+      const primaryScore = getUtilizationScore(primary.name, primaryUsage);
+      // Stay on primary if best fallback is rejected or has worse utilization
+      if (bestRejected || bestScore >= primaryScore) {
+        return primary;
+      }
       const exceeded = getExceededMetric(primary.name, primaryUsage);
-      console.log(`[multi-account] ${primary.name} → ${best.name}: ${exceeded.name} at ${Math.round(exceeded.value * 100)}% (all accounts busy)`);
+      const msg = `${primary.name} → ${best.name}: ${exceeded.name} at ${Math.round(exceeded.value * 100)}% (all accounts busy)`;
+      console.log(`[multi-account] ${msg}`);
+      _showToast("Account Switch", msg, "warning");
       return best;
     }
     return primary;
@@ -712,7 +992,9 @@ function selectThresholdAccount(accounts, state) {
       state.lastPrimaryCheck = now;
       
       if (!isOverThreshold(primary.name, primaryUsage)) {
-        console.log(`[multi-account] → ${primary.name}: under threshold, switching back`);
+        const msg = `→ ${primary.name}: under threshold, switching back`;
+        console.log(`[multi-account] ${msg}`);
+        _showToast("Account Switch", msg, "success");
         return primary;
       }
     }
@@ -982,8 +1264,27 @@ function rewriteUrl(input) {
 /**
  * @type {import('@opencode-ai/plugin').Plugin}
  */
-export async function AnthropicAuthPlugin({ client }) {
+export async function AnthropicAuthPlugin({ client, directory, worktree }) {
+  // Store client reference for toast notifications
+  _pluginClient = client;
+  _pluginDirectory = directory;
+  _pluginWorktree = worktree;
+
   return {
+    // Custom tool: oc_ma_usage - returns account usage dashboard without LLM cost
+    tool: {
+      oc_ma_usage: {
+        description: "Show multi-account usage dashboard with current account, utilization percentages, token consumption, and switch status. Call this when the user asks about account usage, rate limits, or costs.",
+        args: {},
+        async execute() {
+          const data = loadData();
+          if (!data?.accounts?.length) {
+            return "Multi-account not configured. Only single account active.";
+          }
+          return _formatUsageDashboard(data);
+        },
+      },
+    },
     "experimental.chat.system.transform": (input, output) => {
       const prefix =
         "You are Claude Code, Anthropic's official CLI for Claude.";
@@ -1007,17 +1308,8 @@ export async function AnthropicAuthPlugin({ client }) {
 
         // Handle multi-account auth
         if (auth.type === "oauth" && hasMultiAccounts) {
-          // zero out cost for max plan
-          for (const model of Object.values(provider.models)) {
-            model.cost = {
-              input: 0,
-              output: 0,
-              cache: {
-                read: 0,
-                write: 0,
-              },
-            };
-          }
+          // Set real Anthropic pricing so OpenCode's TUI shows actual equivalent costs
+          setRealModelCosts(provider.models);
 
           return {
             apiKey: "",
@@ -1043,12 +1335,15 @@ export async function AnthropicAuthPlugin({ client }) {
                }
 
                // Track state for threshold logic
-               const previousAccount = data.currentAccount;
-               const primaryName = accounts[0]?.name;
-               data.currentAccount = account.name;
-               if (account.name !== previousAccount && account.name !== primaryName) {
-                 data.lastPrimaryCheck = Date.now();
-               }
+                const previousAccount = data.currentAccount;
+                const primaryName = accounts[0]?.name;
+                data.currentAccount = account.name;
+                if (account.name !== previousAccount) {
+                  logSwitch(data, previousAccount, account.name, "threshold evaluation");
+                  if (account.name !== primaryName) {
+                    data.lastPrimaryCheck = Date.now();
+                  }
+                }
 
                // Refresh account token, fallback to other account on token failure.
                const attemptedAccounts = new Set();
@@ -1070,8 +1365,10 @@ export async function AnthropicAuthPlugin({ client }) {
                  }
                }
 
-              // Increment request counter
+              // Increment request counter and start timing
               data.requestCount = (data.requestCount || 0) + 1;
+              const _requestStartTime = Date.now();
+              const _didSwitch = previousAccount && previousAccount !== account.name;
 
               const requestInit = init ?? {};
               const requestHeaders = mergeHeaders(input, init);
@@ -1087,6 +1384,8 @@ export async function AnthropicAuthPlugin({ client }) {
               }
 
               let body = requestInit.body;
+              // Extract request body metadata for analytics before tool name transformation
+              const _bodyMeta = _extractRequestBodyMeta(body);
               if (body && typeof body === "string") {
                 body = prefixToolNames(body);
               }
@@ -1124,6 +1423,46 @@ export async function AnthropicAuthPlugin({ client }) {
                   body,
                   headers: requestHeaders,
                 });
+
+                // Handle 429 rate limit: switch to another account transparently
+                if (response.status === 429) {
+                  const rateLimitAccount = accounts.find(
+                    (candidate) =>
+                      !attemptedRequestAccounts.has(candidate.name) &&
+                      (!data.authFailures?.[candidate.name] || data.authFailures[candidate.name] <= Date.now()),
+                  );
+
+                  if (rateLimitAccount) {
+                    const msg = `429 on ${account.name}, switched to ${rateLimitAccount.name}`;
+                    console.warn(`[multi-account] ${msg}`);
+                    _showToast("Rate Limit Switch", msg, "error", 8000);
+
+                    account = rateLimitAccount;
+                    data.currentAccount = account.name;
+                    if (account.name !== previousAccount && account.name !== primaryName) {
+                      data.lastPrimaryCheck = Date.now();
+                    }
+
+                    const rlRefresh = await ensureFreshAccountToken(account, data);
+                    if (!rlRefresh.ok) {
+                      data.authFailures = data.authFailures || {};
+                      data.authFailures[account.name] = Date.now() + AUTH_FAILURE_COOLDOWN;
+                      continue;
+                    }
+                    // Update auth headers for the new account
+                    if (account.type === "api_key" && account.apiKey) {
+                      requestHeaders.set("x-api-key", account.apiKey);
+                      requestHeaders.delete("authorization");
+                    } else {
+                      requestHeaders.set("authorization", `Bearer ${account.access}`);
+                      requestHeaders.delete("x-api-key");
+                    }
+                    continue;
+                  }
+                  // All accounts exhausted -- let the 429 pass through to OpenCode
+                  _showToast("All Accounts Exhausted", "All accounts rate limited. Passing 429 to OpenCode.", "error", 10000);
+                  break;
+                }
 
                 if (response.status !== 401 && response.status !== 403) {
                   break;
@@ -1209,38 +1548,121 @@ export async function AnthropicAuthPlugin({ client }) {
               // Save consolidated data
               saveData(data);
 
-              // Track token consumption from response body
-              try {
-                const cloned = response.clone();
-                const respBody = await cloned.json().catch(() => null);
-                if (respBody?.usage) {
-                  const model = respBody.model || "unknown";
-                  const inputTokens = respBody.usage.input_tokens || 0;
-                  const outputTokens = respBody.usage.output_tokens || 0;
-                  trackConsumption(account.name, model, inputTokens, outputTokens, data);
-                  saveData(data);
-                }
-              } catch {}
+              // Console log status when utilization changes significantly
+              const currentUsage = data.usage[account.name];
+              if (_shouldLogUtilization(account.name, currentUsage)) {
+                const extra = currentUsage?.extraCredit?.detected ? " [EXTRA CREDIT]" : "";
+                console.log(`[multi-account] active: ${account.name}${extra} | ${_formatUtilization(currentUsage)}`);
+                _recordLoggedUtilization(account.name, currentUsage);
+              }
 
-              // Transform streaming response to strip tool prefixes
-              return createStrippedStream(response);
+              // Auto-toast every N requests
+              if (data.requestCount % AUTO_TOAST_INTERVAL === 0) {
+                const lines = accounts.map((a) => {
+                  const u = data.usage?.[a.name];
+                  const tag = a.name === account.name ? "*" : " ";
+                  const extra = u?.extraCredit?.detected ? " [EC]" : "";
+                  return `${tag}${a.name}${extra}: ${_formatUtilization(u)}`;
+                }).join(" | ");
+                _showToast("Multi-Account Status", lines, "info", 4000);
+              }
+
+              // Track token consumption from streaming response
+              // Clone before the stream is consumed by createStrippedStream
+              const consumptionClone = response.clone();
+              const strippedResponse = createStrippedStream(response);
+
+              // Parse consumption in background (don't block the response)
+              const _accountName = account.name;
+              const _extraCredit = !!(data.usage[_accountName]?.extraCredit?.detected);
+              // Capture rate limit headers for logging
+              const _rateLimits = {
+                session5h: parseFloat(response.headers.get('anthropic-ratelimit-unified-5h-utilization') || '') || null,
+                weekly7d: parseFloat(response.headers.get('anthropic-ratelimit-unified-7d-utilization') || '') || null,
+                weekly7dSonnet: parseFloat(response.headers.get('anthropic-ratelimit-unified-7d_sonnet-utilization') || '') || null,
+              };
+              const _responseRequestId = response.headers.get('request-id') || response.headers.get('x-request-id') || null;
+
+              consumptionClone.text().then((text) => {
+                try {
+                  let totalInput = 0, totalOutput = 0, totalCacheRead = 0, totalCacheWrite = 0, totalReasoning = 0;
+                  let model = data._lastModel || "unknown";
+                  let stopReason = null;
+                  let messageId = null;
+                  // Parse SSE stream events
+                  const lines = text.split('\n');
+                  for (const line of lines) {
+                    if (!line.startsWith('data: ')) continue;
+                    const jsonStr = line.slice(6);
+                    if (jsonStr === '[DONE]') continue;
+                    try {
+                      const event = JSON.parse(jsonStr);
+                      if (event.type === 'message_start' && event.message) {
+                        const msg = event.message;
+                        if (msg.usage) {
+                          totalInput += msg.usage.input_tokens || 0;
+                          totalCacheRead += msg.usage.cache_read_input_tokens || 0;
+                          totalCacheWrite += msg.usage.cache_creation_input_tokens || 0;
+                        }
+                        model = msg.model || model;
+                        messageId = msg.id || null;
+                        stopReason = msg.stop_reason || null;
+                        data._lastModel = model;
+                        if (totalInput > 0) {
+                          trackConsumption(_accountName, model, totalInput, 0, data);
+                        }
+                      }
+                      if (event.type === 'message_delta') {
+                        if (event.usage) {
+                          totalOutput += event.usage.output_tokens || 0;
+                          totalReasoning += event.usage.reasoning_tokens || 0;
+                        }
+                        if (event.delta?.stop_reason) {
+                          stopReason = event.delta.stop_reason;
+                        }
+                        if (totalOutput > 0) {
+                          trackConsumption(_accountName, event.model || model, 0, totalOutput, data);
+                        }
+                      }
+                    } catch {}
+                  }
+                  saveData(data);
+
+                  // Log request for analytics
+                  const [inputRate, outputRate, cacheReadRate, cacheWriteRate] = getModelPricing(model);
+                  const cost = (totalInput * (inputRate || 0) + totalOutput * (outputRate || 0)
+                    + totalCacheRead * (cacheReadRate || 0) + totalCacheWrite * (cacheWriteRate || 0)) / 1_000_000;
+                  _logRequest({
+                    account: _accountName,
+                    model,
+                    inputTokens: totalInput,
+                    outputTokens: totalOutput,
+                    cacheReadTokens: totalCacheRead,
+                    cacheWriteTokens: totalCacheWrite,
+                    reasoningTokens: totalReasoning,
+                    cost,
+                    durationMs: Date.now() - _requestStartTime,
+                    statusCode: response.status,
+                    stopReason,
+                    requestId: _responseRequestId || messageId,
+                    switched: _didSwitch,
+                    switchReason: _didSwitch ? `${previousAccount} → ${_accountName}` : null,
+                    extraCredit: _extraCredit,
+                    bodyMeta: _bodyMeta,
+                    rateLimits: _rateLimits,
+                  });
+                } catch {}
+              }).catch(() => {});
+
+              return strippedResponse;
             },
           };
         }
 
         // Handle single OAuth auth (original behavior)
         if (auth.type === "oauth") {
-          // zero out cost for max plan
-          for (const model of Object.values(provider.models)) {
-            model.cost = {
-              input: 0,
-              output: 0,
-              cache: {
-                read: 0,
-                write: 0,
-              },
-            };
-          }
+          // Set real Anthropic pricing so OpenCode's TUI shows actual equivalent costs
+          setRealModelCosts(provider.models);
           return {
             apiKey: "",
             /**
