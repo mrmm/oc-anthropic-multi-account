@@ -1743,24 +1743,39 @@ async function cmdRefresh(accountName?: string) {
       data.usage[account.name] = data.usage[account.name] || {};
       const usage = data.usage[account.name];
 
+      // Usage API returns utilization as percentage (e.g. 81.0 for 81%)
+      // or as 0-1 fraction. Normalize to 0-1 scale for consistency with
+      // response headers which use 0-1 scale.
+      function normalizeUtil(val: number): number {
+        return val > 1 ? val / 100 : val;
+      }
+
       if (json.five_hour) {
         usage.session5h = {
-          utilization: json.five_hour.utilization || 0,
-          reset: usage.session5h?.reset || null,
+          utilization: normalizeUtil(json.five_hour.utilization || 0),
+          reset: json.five_hour.resets_at
+            ? Math.floor(new Date(json.five_hour.resets_at).getTime() / 1000)
+            : usage.session5h?.reset || null,
           status: usage.session5h?.status || "allowed",
         };
       }
       if (json.seven_day) {
         usage.weekly7d = {
-          utilization: json.seven_day.utilization || 0,
-          reset: usage.weekly7d?.reset || null,
+          utilization: normalizeUtil(json.seven_day.utilization || 0),
+          reset: json.seven_day.resets_at
+            ? Math.floor(new Date(json.seven_day.resets_at).getTime() / 1000)
+            : usage.weekly7d?.reset || null,
           status: usage.weekly7d?.status || "allowed",
         };
       }
       if (json.seven_day_sonnet) {
         usage.weekly7dSonnet = {
-          utilization: json.seven_day_sonnet.utilization || 0,
-          reset: usage.weekly7dSonnet?.reset || null,
+          utilization: normalizeUtil(json.seven_day_sonnet.utilization || 0),
+          reset: json.seven_day_sonnet.resets_at
+            ? Math.floor(
+                new Date(json.seven_day_sonnet.resets_at).getTime() / 1000,
+              )
+            : usage.weekly7dSonnet?.reset || null,
           status: usage.weekly7dSonnet?.status || "allowed",
         };
       }
