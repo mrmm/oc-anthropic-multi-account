@@ -1102,40 +1102,85 @@ function updateUsageState(alias: string, quota: QuotaSnapshot): void {
   saveState(state);
 }
 
-async function cmdPing(alias: string) {
+function miniProgressBar(utilization: number, width: number = 15): string {
+  const filled = Math.round(utilization * width);
+  let bar = "";
+  for (let i = 0; i < width; i++) {
+    if (i < filled) {
+      bar += "\u2501"; // ━
+    } else {
+      bar += "\x1b[2m\u2591\x1b[0m"; // dim ░
+    }
+  }
+  return bar;
+}
+
+function formatQuotaLine(label: string, metric: QuotaMetric | null): string {
+  if (!metric) {
+    return `  ${label.padEnd(17)}\x1b[2m\u2014   no data\x1b[0m`;
+  }
+  const pct = Math.round(metric.utilization * 100);
+  const pctStr = `${pct}%`.padStart(4);
+  const bar = miniProgressBar(metric.utilization);
+  const reset = metric.reset ? `resets ${formatResetTime(metric.reset)}` : "";
+  return `  ${label.padEnd(17)}${pctStr}  ${bar}  \x1b[2m${reset}\x1b[0m`;
+}
+
+async function cmdPing(alias: string, jsonMode: boolean = false) {
   try {
     const accounts = loadAccounts();
     const account = accounts.find((item: any) => item.name === alias);
 
     if (!account) {
       const available = accounts.map((a: any) => a.name).join(", ");
-      console.log(
-        JSON.stringify({
-          status: "error",
-          alias,
-          error: `Account '${alias}' not found. Available: ${available || "none"}`,
-        }),
-      );
+      if (jsonMode) {
+        console.log(
+          JSON.stringify({
+            status: "error",
+            alias,
+            error: `Account '${alias}' not found. Available: ${available || "none"}`,
+          }),
+        );
+      } else {
+        console.log(`\n  \u274c Account '${alias}' not found`);
+        console.log(`     Available: ${available || "none"}`);
+        console.log(`     Run: bun src/cli.ts list\n`);
+      }
       return;
     }
 
     if (!account.access && !account.refresh) {
-      console.log(
-        JSON.stringify({
-          status: "error",
-          alias,
-          error: `Missing credentials. Re-authenticate with: bun src/cli.ts reauth ${alias}`,
-        }),
-      );
+      if (jsonMode) {
+        console.log(
+          JSON.stringify({
+            status: "error",
+            alias,
+            error: `Missing credentials. Re-authenticate with: bun src/cli.ts reauth ${alias}`,
+          }),
+        );
+      } else {
+        console.log(`\n  \u274c Missing credentials for '${alias}'`);
+        console.log(`     Run: bun src/cli.ts reauth ${alias}\n`);
+      }
       return;
+    }
+
+    if (!jsonMode) {
+      console.log(`\n  \ud83d\udd0d Pinging ${alias}...`);
     }
 
     // Refresh token if expired
     const refreshError = await refreshToken(account);
     if (refreshError) {
-      console.log(
-        JSON.stringify({ status: "error", alias, error: refreshError }),
-      );
+      if (jsonMode) {
+        console.log(
+          JSON.stringify({ status: "error", alias, error: refreshError }),
+        );
+      } else {
+        console.log(`\n  \u274c Token refresh failed`);
+        console.log(`     ${refreshError}`);
+        console.log(`     Run: bun src/cli.ts reauth ${alias}\n`);
+      }
       return;
     }
 
@@ -1161,22 +1206,69 @@ async function cmdPing(alias: string) {
       if (quota) {
         updateUsageState(alias, quota);
       }
-      console.log(
-        JSON.stringify({ status: "ok", alias, quota: quota ?? undefined }),
-      );
+
+      if (jsonMode) {
+        console.log(
+          JSON.stringify({ status: "ok", alias, quota: quota ?? undefined }),
+        );
+        return;
+      }
+
+      console.log(`\n  \u2705 Account is reachable`);
+
+      if (quota) {
+        // Determine overall status from metrics
+        const statuses = [
+          quota.session5h?.status,
+          quota.weekly7d?.status,
+          quota.weekly7dSonnet?.status,
+        ].filter(Boolean);
+        const overallStatus = statuses.includes("limited")
+          ? "limited"
+          : "allowed";
+
+        console.log(`\n  \ud83d\udcca Rate Limits`);
+        console.log(
+          `  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500`,
+        );
+        console.log(formatQuotaLine("Session (5h)", quota.session5h));
+        console.log(formatQuotaLine("Weekly (all)", quota.weekly7d));
+        console.log(formatQuotaLine("Weekly (Sonnet)", quota.weekly7dSonnet));
+        console.log(`\n  Status: ${overallStatus}`);
+      } else {
+        console.log(`\n  \x1b[2mNo rate limit data in response\x1b[0m`);
+      }
+
+      console.log();
       return;
     }
 
     const text = await res.text();
-    console.log(
-      JSON.stringify({
-        status: "error",
-        alias,
-        error: `HTTP ${res.status}: ${text.slice(0, 200)}`,
-      }),
-    );
+    if (jsonMode) {
+      console.log(
+        JSON.stringify({
+          status: "error",
+          alias,
+          error: `HTTP ${res.status}: ${text.slice(0, 200)}`,
+        }),
+      );
+    } else {
+      console.log(`\n  \u274c Request failed (HTTP ${res.status})`);
+      console.log(`     ${text.slice(0, 200)}`);
+      console.log(
+        `     Run: bun src/cli.ts test ${alias}    Full diagnostics\n`,
+      );
+    }
   } catch (err) {
-    console.log(JSON.stringify({ status: "error", alias, error: String(err) }));
+    if (jsonMode) {
+      console.log(
+        JSON.stringify({ status: "error", alias, error: String(err) }),
+      );
+    } else {
+      console.log(`\n  \u274c Connection error`);
+      console.log(`     ${String(err)}`);
+      console.log(`     Check your network and try again\n`);
+    }
   }
 }
 
@@ -1894,7 +1986,7 @@ function showHelp() {
   MONITORING
     usage, u [--watch]      Show rate limit usage dashboard
     test <name>             Test account connectivity and quotas
-    ping <name>             Ping account (JSON output)
+    ping <name> [--json]    Ping account (human-readable, or JSON with --json)
     diagnose                Run system diagnostics
 
   ACCOUNT SWITCHING
@@ -1951,7 +2043,7 @@ async function main() {
       await cmdReauth(rest[0], rest[1], rest[2]);
       break;
     case "ping":
-      await cmdPing(rest[0]);
+      await cmdPing(rest[0], rest.includes("--json"));
       break;
     case "test":
       await cmdTest(rest[0]);
