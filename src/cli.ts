@@ -1718,15 +1718,29 @@ async function cmdReauth(alias: string, args: string[]) {
       return;
     }
 
-    // Interactive mode — detect auth type from existing account
-    const authType = account.type || (account.apiKey ? "api_key" : "oauth");
+    // Interactive mode — detect auth type, allow override with --method
+    const methodFlag =
+      args.find((a) => a.startsWith("--method="))?.split("=")[1] ||
+      (args.includes("--method") ? args[args.indexOf("--method") + 1] : null);
+
+    let authType: string;
+    if (methodFlag === "oauth" || methodFlag === "apikey") {
+      authType = methodFlag === "apikey" ? "api_key" : "oauth";
+    } else {
+      authType = account.type || (account.apiKey ? "api_key" : "oauth");
+    }
+
+    const label = authType === "api_key" ? "API Key" : "Claude Pro/Max (OAuth)";
+    const isOverride =
+      methodFlag &&
+      authType !== (account.type || (account.apiKey ? "api_key" : "oauth"));
 
     console.log(`\n  \ud83d\udd10 Re-authenticating: ${alias}`);
     console.log(
       "  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n",
     );
     console.log(
-      `  Auth type: ${authType === "api_key" ? "API Key" : "Claude Pro/Max (OAuth)"}\n`,
+      `  Auth type: ${label}${isOverride ? " (switching from " + (authType === "api_key" ? "OAuth" : "API Key") + ")" : ""}\n`,
     );
 
     if (authType === "api_key") {
@@ -2475,8 +2489,12 @@ function showHelp() {
 
   ACCOUNT MANAGEMENT
     add <name>              Add account (OAuth or API key)
-    reauth <name>           Re-authenticate account
-    reauth <name> --json    Re-authenticate (JSON output for scripting)
+    reauth <name>           Re-authenticate (uses same method as add)
+    reauth <name> --method oauth
+                            Override: switch to OAuth authentication
+    reauth <name> --method apikey
+                            Override: switch to API key authentication
+    reauth <name> --json    Re-authenticate (JSON for scripting)
     list, ls                List all configured accounts
     set-primary <name>      Set an account as the primary
     remove, rm <name>       Remove an account
