@@ -3182,6 +3182,7 @@ function cmdSwitch(name: string) {
 
   data.currentAccount = name;
   data.lastPrimaryCheck = Date.now(); // Reset check timer
+  logSwitch(data, previous, name, "manual switch");
   saveData(data);
 
   console.log(`\n  ⚡ Switched: ${previous} → ${name}`);
