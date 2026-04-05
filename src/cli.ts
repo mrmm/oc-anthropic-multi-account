@@ -103,6 +103,29 @@ function allSame(pm: PerMetric): boolean {
   return pm.session5h === pm.weekly7d && pm.weekly7d === pm.weekly7dSonnet;
 }
 
+/**
+ * Resolve thresholds for a specific account, merging per-account overrides with global defaults.
+ */
+function getAccountThresholds(accountName: string, config: any): PerMetric {
+  const globalThreshold = normalizeThresholds(
+    config?.threshold,
+    DEFAULTS.threshold,
+  );
+  const accountConfig = config?.accounts?.[accountName];
+  if (!accountConfig?.threshold) return globalThreshold;
+
+  const accountThreshold = normalizeThresholds(
+    accountConfig.threshold,
+    undefined as any,
+  );
+  return {
+    session5h: accountThreshold.session5h ?? globalThreshold.session5h,
+    weekly7d: accountThreshold.weekly7d ?? globalThreshold.weekly7d,
+    weekly7dSonnet:
+      accountThreshold.weekly7dSonnet ?? globalThreshold.weekly7dSonnet,
+  };
+}
+
 // ============================================================================
 // File helpers (atomic write + backup fallback)
 // ============================================================================
@@ -387,17 +410,17 @@ function renderUsage(watch: boolean) {
     return;
   }
 
-  const t = normalizeThresholds(config.threshold, DEFAULTS.threshold);
+  const globalT = normalizeThresholds(config.threshold, DEFAULTS.threshold);
 
   // Compact table mode for watch with 3+ accounts
   if (watch && accounts.length >= 3) {
-    renderCompactUsage(accounts, state, t, totalRequests);
+    renderCompactUsage(accounts, state, config, totalRequests);
 
     // Summary line
     const activeAcct = state.currentAccount || accounts[0]?.name || "none";
-    const threshStr = allSame(t)
-      ? `${Math.round(t.session5h * 100)}%`
-      : `${Math.round(t.session5h * 100)}/${Math.round(t.weekly7d * 100)}/${Math.round(t.weekly7dSonnet * 100)}%`;
+    const threshStr = allSame(globalT)
+      ? `${Math.round(globalT.session5h * 100)}%`
+      : `${Math.round(globalT.session5h * 100)}/${Math.round(globalT.weekly7d * 100)}/${Math.round(globalT.weekly7dSonnet * 100)}%`;
     const intervalMin =
       (config.checkInterval ?? DEFAULTS.checkInterval) / 60000;
     console.log(
@@ -412,22 +435,23 @@ function renderUsage(watch: boolean) {
     return;
   }
 
-  const thresholdMap: Record<string, number> = {
-    session5h: t.session5h,
-    weekly7d: t.weekly7d,
-    weekly7dSonnet: t.weekly7dSonnet,
-  };
-
   const BAR_W = 35;
   const LABEL_W = 16;
 
   for (const account of accounts) {
     const isActive = state.currentAccount === account.name;
     const usage = state.usage?.[account.name];
+    const acctT = getAccountThresholds(account.name, config);
+    const thresholdMap: Record<string, number> = {
+      session5h: acctT.session5h,
+      weekly7d: acctT.weekly7d,
+      weekly7dSonnet: acctT.weekly7dSonnet,
+    };
 
     // Top border with account name
     const activeTag = isActive ? " \u25c4 ACTIVE" : "";
-    const titleContent = `\u2500 ${account.name}${activeTag} `;
+    const authType = account.type === "api_key" ? " [API key]" : "";
+    const titleContent = `\u2500 ${account.name}${authType}${activeTag} `;
     const topPad = Math.max(0, CARD_W - 4 - titleContent.length);
     const topBorder = `  \u250c${titleContent}${"\u2500".repeat(topPad)}\u2510`;
     if (isActive) {
@@ -438,9 +462,11 @@ function renderUsage(watch: boolean) {
 
     // Status line
     const authStatus =
-      account.expires > Date.now()
-        ? "\u2705 Authenticated"
-        : "\u26a0\ufe0f  Token expired";
+      account.type === "api_key"
+        ? "\u2705 API Key"
+        : account.expires > Date.now()
+          ? "\u2705 Authenticated"
+          : "\u26a0\ufe0f  Token expired";
     const reqCount = totalRequests;
     const lastUsed = relativeLastUsed(usage?.timestamp || null);
     const statusLine = `${authStatus} \u00b7 ${isActive ? reqCount + " requests" : "0 requests"} \u00b7 ${isActive ? "last used " + lastUsed : "idle"}`;
@@ -505,9 +531,9 @@ function renderUsage(watch: boolean) {
 
   // Summary line
   const activeAcct = state.currentAccount || accounts[0]?.name || "none";
-  const threshStr = allSame(t)
-    ? `${Math.round(t.session5h * 100)}%`
-    : `${Math.round(t.session5h * 100)}/${Math.round(t.weekly7d * 100)}/${Math.round(t.weekly7dSonnet * 100)}%`;
+  const threshStr = allSame(globalT)
+    ? `${Math.round(globalT.session5h * 100)}%`
+    : `${Math.round(globalT.session5h * 100)}/${Math.round(globalT.weekly7d * 100)}/${Math.round(globalT.weekly7dSonnet * 100)}%`;
   const intervalMin = (config.checkInterval ?? DEFAULTS.checkInterval) / 60000;
   console.log(
     `\n  Active: ${activeAcct} \u00b7 Thresholds: ${threshStr} \u00b7 Check interval: ${intervalMin}m`,
@@ -582,15 +608,9 @@ function compactBar(
 function renderCompactUsage(
   accounts: any[],
   state: any,
-  t: PerMetric,
+  config: any,
   totalRequests: number,
 ) {
-  const thresholdMap: Record<string, number> = {
-    session5h: t.session5h,
-    weekly7d: t.weekly7d,
-    weekly7dSonnet: t.weekly7dSonnet,
-  };
-
   // Header
   const nameW = Math.max(14, ...accounts.map((a: any) => a.name.length + 4));
   console.log();
@@ -605,8 +625,14 @@ function renderCompactUsage(
     const isActive = state.currentAccount === account.name;
     const usage = state.usage?.[account.name];
     const activeTag = isActive ? " \u25c4" : "";
-    const authOk = account.expires > Date.now();
+    const authOk = account.type === "api_key" || account.expires > Date.now();
     const statusIcon = authOk ? "\u2705" : "\u26a0\ufe0f";
+    const acctT = getAccountThresholds(account.name, config);
+    const thresholdMap: Record<string, number> = {
+      session5h: acctT.session5h,
+      weekly7d: acctT.weekly7d,
+      weekly7dSonnet: acctT.weekly7dSonnet,
+    };
 
     let cols = "";
     if (!usage) {
@@ -641,6 +667,158 @@ function cmdUsage(args: string[]) {
 function cmdConfig(args: string[]) {
   const state = loadState();
 
+  const parseArg = (flag: string) => {
+    const idx = args.indexOf(flag);
+    return idx !== -1 ? args[idx + 1] : null;
+  };
+
+  const accountName = parseArg("--account");
+
+  // Per-account config mode
+  if (accountName) {
+    const accounts = loadAccounts();
+    if (!accounts.find((a: any) => a.name === accountName)) {
+      const available = accounts.map((a: any) => a.name).join(", ");
+      console.error(`\n  ❌ Account '${accountName}' not found`);
+      console.error(`     Available: ${available || "none"}\n`);
+      return;
+    }
+
+    state.config = state.config || {};
+    state.config.accounts = state.config.accounts || {};
+
+    // Show per-account config
+    const hasThresholdArg =
+      args.includes("--threshold") ||
+      args.includes("--thresholds") ||
+      args.includes("--threshold-session") ||
+      args.includes("--threshold-weekly") ||
+      args.includes("--threshold-sonnet");
+
+    if (!hasThresholdArg && !args.includes("--reset")) {
+      const t = getAccountThresholds(accountName, state.config);
+      const globalT = normalizeThresholds(
+        state.config.threshold,
+        DEFAULTS.threshold,
+      );
+      const hasOverride = !!state.config.accounts[accountName]?.threshold;
+
+      console.log(`\n  ⚙️  Configuration for account: ${accountName}`);
+      console.log("  ────────────────────────────────────────\n");
+      if (hasOverride) {
+        console.log(`    Thresholds (per-account override):`);
+      } else {
+        console.log(`    Thresholds (using global defaults):`);
+      }
+      console.log(`      Session (5h):    ${Math.round(t.session5h * 100)}%`);
+      console.log(`      Weekly (all):    ${Math.round(t.weekly7d * 100)}%`);
+      console.log(
+        `      Weekly (Sonnet): ${Math.round(t.weekly7dSonnet * 100)}%`,
+      );
+      if (hasOverride) {
+        const gStr = allSame(globalT)
+          ? `${Math.round(globalT.session5h * 100)}%`
+          : `${Math.round(globalT.session5h * 100)}/${Math.round(globalT.weekly7d * 100)}/${Math.round(globalT.weekly7dSonnet * 100)}%`;
+        console.log(`\n    Global fallback:   ${gStr}`);
+      }
+      console.log(
+        `\n  💡 Run: bun src/cli.ts config --account ${accountName} --threshold 0.80\n`,
+      );
+      return;
+    }
+
+    // Reset per-account config
+    if (args.includes("--reset")) {
+      delete state.config.accounts[accountName];
+      if (Object.keys(state.config.accounts).length === 0) {
+        delete state.config.accounts;
+      }
+      saveState(state);
+      console.log(
+        `\n  ✅ Per-account config for '${accountName}' removed (using global defaults)\n`,
+      );
+      return;
+    }
+
+    // Set per-account thresholds
+    state.config.accounts[accountName] =
+      state.config.accounts[accountName] || {};
+    let changed = false;
+
+    const t = parseArg("--threshold");
+    if (t) {
+      const val = parseFloat(t);
+      if (isNaN(val) || val < 0 || val > 1) {
+        console.error(
+          "\n  ❌ Invalid threshold value. Must be between 0 and 1\n",
+        );
+        return;
+      }
+      state.config.accounts[accountName].threshold = val;
+      changed = true;
+    }
+
+    const ta = parseArg("--thresholds");
+    if (ta) {
+      const parts = ta.split(",").map(Number);
+      if (parts.length !== 3 || parts.some(isNaN)) {
+        console.error(
+          "\n  ❌ Invalid --thresholds format. Expected: <session>,<weekly>,<sonnet>\n",
+        );
+        return;
+      }
+      state.config.accounts[accountName].threshold = {
+        session5h: parts[0] / 100,
+        weekly7d: parts[1] / 100,
+        weekly7dSonnet: parts[2] / 100,
+      };
+      changed = true;
+    }
+
+    const ts = parseArg("--threshold-session");
+    if (ts) {
+      const current = state.config.accounts[accountName].threshold;
+      const resolved = getAccountThresholds(accountName, state.config);
+      if (typeof current !== "object" || current === null) {
+        state.config.accounts[accountName].threshold = { ...resolved };
+      }
+      state.config.accounts[accountName].threshold.session5h = parseFloat(ts);
+      changed = true;
+    }
+
+    const tw = parseArg("--threshold-weekly");
+    if (tw) {
+      const current = state.config.accounts[accountName].threshold;
+      const resolved = getAccountThresholds(accountName, state.config);
+      if (typeof current !== "object" || current === null) {
+        state.config.accounts[accountName].threshold = { ...resolved };
+      }
+      state.config.accounts[accountName].threshold.weekly7d = parseFloat(tw);
+      changed = true;
+    }
+
+    const tso = parseArg("--threshold-sonnet");
+    if (tso) {
+      const current = state.config.accounts[accountName].threshold;
+      const resolved = getAccountThresholds(accountName, state.config);
+      if (typeof current !== "object" || current === null) {
+        state.config.accounts[accountName].threshold = { ...resolved };
+      }
+      state.config.accounts[accountName].threshold.weekly7dSonnet =
+        parseFloat(tso);
+      changed = true;
+    }
+
+    if (changed) {
+      autoEvaluate(state);
+      saveState(state);
+      console.log(`\n  ✅ Per-account config for '${accountName}' saved`);
+      cmdConfig(["--account", accountName]);
+    }
+    return;
+  }
+
+  // Global config mode (original behavior)
   if (args.includes("--show") || args.length === 0) {
     const cfg = state.config || {};
     const t = normalizeThresholds(cfg.threshold, DEFAULTS.threshold);
@@ -660,6 +838,28 @@ function cmdConfig(args: string[]) {
     console.log(
       `    Check interval:    ${(cfg.checkInterval ?? DEFAULTS.checkInterval) / 60000} min`,
     );
+
+    // Show per-account overrides if any exist
+    const accountOverrides = cfg.accounts;
+    if (accountOverrides && Object.keys(accountOverrides).length > 0) {
+      console.log("\n    Per-account overrides:");
+      for (const [name, acctCfg] of Object.entries(accountOverrides) as [
+        string,
+        any,
+      ][]) {
+        if (acctCfg?.threshold) {
+          const at = getAccountThresholds(name, cfg);
+          if (allSame(at)) {
+            console.log(`      ${name}: ${Math.round(at.session5h * 100)}%`);
+          } else {
+            console.log(
+              `      ${name}: ${Math.round(at.session5h * 100)}/${Math.round(at.weekly7d * 100)}/${Math.round(at.weekly7dSonnet * 100)}%`,
+            );
+          }
+        }
+      }
+    }
+
     console.log(
       "\n  💡 Run: bun src/cli.ts config --threshold 0.80    Change thresholds\n",
     );
@@ -678,11 +878,6 @@ function cmdConfig(args: string[]) {
 
   state.config = state.config || {};
   let changed = false;
-
-  const parseArg = (flag: string) => {
-    const idx = args.indexOf(flag);
-    return idx !== -1 ? args[idx + 1] : null;
-  };
 
   function ensureThresholdObject() {
     const current = state.config.threshold;
@@ -787,10 +982,10 @@ function autoEvaluate(state: any) {
   if (accounts.length < 2 || !state.currentAccount) return;
 
   const config = state.config || {};
-  const t = normalizeThresholds(config.threshold, DEFAULTS.threshold);
 
-  function isOverThreshold(usage: any): boolean {
+  function isOverThreshold(accountName: string, usage: any): boolean {
     if (!usage) return false;
+    const t = getAccountThresholds(accountName, config);
     return (
       (usage.session5h?.utilization || 0) > t.session5h ||
       (usage.weekly7d?.utilization || 0) > t.weekly7d ||
@@ -803,9 +998,9 @@ function autoEvaluate(state: any) {
   const primaryUsage = state.usage?.[primary.name];
 
   if (currentAccount === primary.name) {
-    if (isOverThreshold(primaryUsage)) {
+    if (isOverThreshold(primary.name, primaryUsage)) {
       for (const fallback of accounts.slice(1)) {
-        if (!isOverThreshold(state.usage?.[fallback.name])) {
+        if (!isOverThreshold(fallback.name, state.usage?.[fallback.name])) {
           state.currentAccount = fallback.name;
           console.log(
             `  ⚡ Auto-switch: ${primary.name} → ${fallback.name} (threshold exceeded)`,
@@ -815,7 +1010,7 @@ function autoEvaluate(state: any) {
       }
     }
   } else {
-    if (!isOverThreshold(primaryUsage)) {
+    if (!isOverThreshold(primary.name, primaryUsage)) {
       state.currentAccount = primary.name;
       console.log(
         `  ⚡ Auto-switch: ${currentAccount} → ${primary.name} (primary under threshold)`,
@@ -872,41 +1067,42 @@ async function cmdAdd(args: string[]) {
   const authCode = args[2]; // The auth code from callback
 
   if (!name) {
-    console.log("\n  🔐 Add Account");
-    console.log("  ────────────────────────────────────────\n");
+    console.log("\n  \ud83d\udd10 Add Account");
+    console.log(
+      "  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n",
+    );
     console.log("  Usage:");
     console.log(
-      "    bun src/cli.ts add <name>                      Interactive OAuth flow",
+      "    bun src/cli.ts add <name>                      Interactive (OAuth or API key)",
     );
     console.log(
-      "    bun src/cli.ts add <name> <auth-url> <code>    Direct mode (URL + code)",
+      "    bun src/cli.ts add <name> <auth-url> <code>    Direct OAuth mode (URL + code)",
     );
     console.log(
-      "    bun src/cli.ts add <name> <auth-url> <code#s>  Direct mode with state",
+      "    bun src/cli.ts add <name> <auth-url> <code#s>  Direct OAuth mode with state",
     );
     console.log();
     return;
   }
 
-  console.log(`\n  🔐 Adding account: ${name}`);
-  console.log("  ────────────────────────────────────────\n");
+  console.log(`\n  \ud83d\udd10 Adding account: ${name}`);
+  console.log(
+    "  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n",
+  );
 
-  let code: string;
-  let verifier: string;
-  let state: string;
-
-  // Direct mode - URL and code provided
+  // Direct mode - URL and code provided (always OAuth)
   if (authUrl && authCode) {
     const extractedState = extractStateFromUrl(authUrl);
     const parsed = parseAuthCode(authCode);
 
-    code = parsed.code;
-    // Use state from auth code if present, otherwise from URL
-    state = parsed.state || extractedState || "";
-    verifier = state;
+    const code = parsed.code;
+    const state = parsed.state || extractedState || "";
+    const verifier = state;
 
     if (!verifier) {
-      console.error("  ❌ Could not extract state/verifier from URL or code");
+      console.error(
+        "  \u274c Could not extract state/verifier from URL or code",
+      );
       console.error(
         "     Run: bun src/cli.ts add " +
           name +
@@ -914,40 +1110,137 @@ async function cmdAdd(args: string[]) {
       );
       return;
     }
-  } else {
-    // Interactive mode - generate PKCE and show auth URL
-    const pkce = await generatePKCE();
-    state = generateState();
 
-    const url = new URL(AUTHORIZE_URLS.max);
-    url.searchParams.set("code", "true");
-    url.searchParams.set("client_id", CLIENT_ID);
-    url.searchParams.set("response_type", "code");
-    url.searchParams.set("redirect_uri", CODE_CALLBACK_URL);
-    url.searchParams.set("scope", OAUTH_SCOPES.join(" "));
-    url.searchParams.set("code_challenge", pkce.challenge);
-    url.searchParams.set("code_challenge_method", "S256");
-    url.searchParams.set("state", state);
+    console.log("  \ud83d\udd10 Exchanging code for tokens...");
 
-    console.log("  1. Open this URL in your browser:\n");
-    console.log(`     ${url.toString()}\n`);
-    console.log("  2. Log in to your Anthropic Max account");
-    console.log("  3. After approval, copy the FULL URL from your browser\n");
+    const response = await fetch(
+      TOKEN_URL,
+      createOAuthTokenRequestInit({
+        code,
+        state: state,
+        grant_type: "authorization_code",
+        client_id: CLIENT_ID,
+        redirect_uri: CODE_CALLBACK_URL,
+        code_verifier: verifier,
+      }),
+    );
 
-    const input = await prompt("  Paste the callback URL here: ");
-
-    // Try to parse as URL
-    try {
-      const parsed = new URL(input);
-      code = parsed.searchParams.get("code") || input;
-    } catch {
-      code = input;
+    if (!response.ok) {
+      const text = await response.text();
+      console.error(
+        `\n  \u274c Token exchange failed (HTTP ${response.status})`,
+      );
+      console.error(`     ${text.slice(0, 200)}`);
+      console.error(
+        "     \ud83d\udca1 Try again or use a fresh authorization URL\n",
+      );
+      return;
     }
 
-    verifier = pkce.verifier;
+    const json = (await response.json()) as {
+      access_token: string;
+      refresh_token: string;
+      expires_in: number;
+    };
+    const multiAuth = loadMultiAuth();
+    multiAuth.accounts ??= [];
+
+    const account = {
+      name,
+      access: json.access_token,
+      refresh: json.refresh_token,
+      expires: Date.now() + json.expires_in * 1000,
+      type: "oauth",
+    };
+    const idx = multiAuth.accounts.findIndex((a: any) => a.name === name);
+
+    if (idx >= 0) {
+      multiAuth.accounts[idx] = account;
+      console.log(`\n  \u2705 Account '${name}' updated`);
+    } else {
+      multiAuth.accounts.push(account);
+      console.log(`\n  \u2705 Account '${name}' added`);
+    }
+
+    saveMultiAuth(multiAuth);
+    console.log("     Restart OpenCode to use the new account");
+    console.log(`     Run: bun src/cli.ts usage    View usage metrics\n`);
+    return;
   }
 
-  console.log("  🔐 Exchanging code for tokens...");
+  // Interactive mode - choose auth method
+  console.log("  Choose authentication method:");
+  console.log("    1. Claude Pro/Max (OAuth)");
+  console.log("    2. Manually enter API Key\n");
+
+  const method = await prompt("  ? Select method (1): ");
+  const choice = method.trim() || "1";
+
+  if (choice === "2") {
+    // Manual API key
+    const apiKey = await prompt("  ? Enter your API key: ");
+    if (!apiKey) {
+      console.error("\n  \u274c No API key provided\n");
+      return;
+    }
+
+    const multiAuth = loadMultiAuth();
+    multiAuth.accounts ??= [];
+
+    const account = {
+      name,
+      apiKey,
+      type: "api_key",
+    };
+    const idx = multiAuth.accounts.findIndex((a: any) => a.name === name);
+
+    if (idx >= 0) {
+      multiAuth.accounts[idx] = account;
+      console.log(`\n  \u2705 Account '${name}' updated with API key`);
+    } else {
+      multiAuth.accounts.push(account);
+      console.log(`\n  \u2705 Account '${name}' added with API key`);
+    }
+
+    saveMultiAuth(multiAuth);
+    console.log("     Restart OpenCode to use the new account");
+    console.log(`     Run: bun src/cli.ts usage    View usage metrics\n`);
+    return;
+  }
+
+  // OAuth flow
+  const pkce = await generatePKCE();
+  const state = generateState();
+
+  const url = new URL(AUTHORIZE_URLS.max);
+  url.searchParams.set("code", "true");
+  url.searchParams.set("client_id", CLIENT_ID);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("redirect_uri", CODE_CALLBACK_URL);
+  url.searchParams.set("scope", OAUTH_SCOPES.join(" "));
+  url.searchParams.set("code_challenge", pkce.challenge);
+  url.searchParams.set("code_challenge_method", "S256");
+  url.searchParams.set("state", state);
+
+  console.log("\n  Step 1: Open this URL in your browser:\n");
+  console.log(`    ${url.toString()}\n`);
+  console.log("  Step 2: Log in to your Anthropic Max account");
+  console.log(
+    "  Step 3: After approval, copy the FULL URL from your browser\n",
+  );
+
+  const input = await prompt("  ? Paste the callback URL here: ");
+
+  let code: string;
+  // Try to parse as URL
+  try {
+    const parsed = new URL(input);
+    code = parsed.searchParams.get("code") || input;
+  } catch {
+    code = input;
+  }
+
+  console.log("\n  \u231b Exchanging code for tokens...");
 
   const response = await fetch(
     TOKEN_URL,
@@ -957,15 +1250,17 @@ async function cmdAdd(args: string[]) {
       grant_type: "authorization_code",
       client_id: CLIENT_ID,
       redirect_uri: CODE_CALLBACK_URL,
-      code_verifier: verifier,
+      code_verifier: pkce.verifier,
     }),
   );
 
   if (!response.ok) {
     const text = await response.text();
-    console.error(`\n  ❌ Token exchange failed (HTTP ${response.status})`);
+    console.error(`\n  \u274c Token exchange failed (HTTP ${response.status})`);
     console.error(`     ${text.slice(0, 200)}`);
-    console.error("     💡 Try again or use a fresh authorization URL\n");
+    console.error(
+      "     \ud83d\udca1 Try again or use a fresh authorization URL\n",
+    );
     return;
   }
 
@@ -982,15 +1277,16 @@ async function cmdAdd(args: string[]) {
     access: json.access_token,
     refresh: json.refresh_token,
     expires: Date.now() + json.expires_in * 1000,
+    type: "oauth",
   };
   const idx = multiAuth.accounts.findIndex((a: any) => a.name === name);
 
   if (idx >= 0) {
     multiAuth.accounts[idx] = account;
-    console.log(`\n  ✅ Account '${name}' updated`);
+    console.log(`\n  \u2705 Account '${name}' updated`);
   } else {
     multiAuth.accounts.push(account);
-    console.log(`\n  ✅ Account '${name}' added`);
+    console.log(`\n  \u2705 Account '${name}' added`);
   }
 
   saveMultiAuth(multiAuth);
@@ -1149,7 +1445,9 @@ async function cmdPing(alias: string, jsonMode: boolean = false) {
       return;
     }
 
-    if (!account.access && !account.refresh) {
+    const isApiKey = account.type === "api_key";
+
+    if (!isApiKey && !account.access && !account.refresh) {
       if (jsonMode) {
         console.log(
           JSON.stringify({
@@ -1169,25 +1467,31 @@ async function cmdPing(alias: string, jsonMode: boolean = false) {
       console.log(`\n  \ud83d\udd0d Pinging ${alias}...`);
     }
 
-    // Refresh token if expired
-    const refreshError = await refreshToken(account);
-    if (refreshError) {
-      if (jsonMode) {
-        console.log(
-          JSON.stringify({ status: "error", alias, error: refreshError }),
-        );
-      } else {
-        console.log(`\n  \u274c Token refresh failed`);
-        console.log(`     ${refreshError}`);
-        console.log(`     Run: bun src/cli.ts reauth ${alias}\n`);
+    // Refresh token if expired (skip for API key accounts)
+    if (!isApiKey) {
+      const refreshError = await refreshToken(account);
+      if (refreshError) {
+        if (jsonMode) {
+          console.log(
+            JSON.stringify({ status: "error", alias, error: refreshError }),
+          );
+        } else {
+          console.log(`\n  \u274c Token refresh failed`);
+          console.log(`     ${refreshError}`);
+          console.log(`     Run: bun src/cli.ts reauth ${alias}\n`);
+        }
+        return;
       }
-      return;
     }
+
+    const authHeaders: Record<string, string> = isApiKey
+      ? { "x-api-key": account.apiKey }
+      : { authorization: `Bearer ${account.access}` };
 
     const res = await fetch("https://api.anthropic.com/v1/messages?beta=true", {
       method: "POST",
       headers: {
-        authorization: `Bearer ${account.access}`,
+        ...authHeaders,
         "anthropic-beta": REQUIRED_BETAS.join(","),
         "user-agent": CLAUDE_CLI_USER_AGENT,
         "content-type": "application/json",
@@ -1272,29 +1576,112 @@ async function cmdPing(alias: string, jsonMode: boolean = false) {
   }
 }
 
-async function cmdReauth(
-  alias: string,
-  callbackUrl?: string,
-  verifier?: string,
-) {
+async function cmdReauth(alias: string, args: string[]) {
+  const jsonMode = args.includes("--json");
+
   try {
     const accounts = loadAccounts();
     const account = accounts.find((item: any) => item.name === alias);
 
     if (!account) {
       const available = accounts.map((a: any) => a.name).join(", ");
-      console.log(
-        JSON.stringify({
-          status: "error",
-          alias,
-          error: `Account '${alias}' not found. Available: ${available || "none"}`,
-        }),
-      );
+      if (jsonMode) {
+        console.log(
+          JSON.stringify({
+            status: "error",
+            alias,
+            error: `Account '${alias}' not found. Available: ${available || "none"}`,
+          }),
+        );
+      } else {
+        console.error(`\n  \u274c Account '${alias}' not found`);
+        console.error(`     Available: ${available || "none"}\n`);
+      }
       return;
     }
 
-    if (!callbackUrl) {
-      // Step 1: Generate auth URL
+    // Legacy JSON mode: callbackUrl and verifier passed as positional args
+    const callbackUrl = args.find((a) => !a.startsWith("--") && a !== alias);
+    const verifierArg = args.find(
+      (a, i) =>
+        !a.startsWith("--") &&
+        a !== alias &&
+        i > args.indexOf(callbackUrl || ""),
+    );
+
+    if (jsonMode && callbackUrl) {
+      // Legacy step 2: exchange callback for tokens (scripting mode)
+      const verifier = verifierArg;
+      if (!verifier) {
+        console.log(
+          JSON.stringify({
+            status: "error",
+            alias,
+            error: "Missing verifier. Use the verifier from step 1.",
+          }),
+        );
+        return;
+      }
+
+      let code: string;
+      try {
+        const parsed = new URL(callbackUrl);
+        code = parsed.searchParams.get("code") || callbackUrl;
+      } catch {
+        code = callbackUrl;
+      }
+
+      const response = await fetch(
+        TOKEN_URL,
+        createOAuthTokenRequestInit({
+          code,
+          state: verifier,
+          grant_type: "authorization_code",
+          client_id: CLIENT_ID,
+          redirect_uri: CODE_CALLBACK_URL,
+          code_verifier: verifier,
+        }),
+      );
+
+      if (!response.ok) {
+        const text = await response.text();
+        console.log(
+          JSON.stringify({
+            status: "error",
+            alias,
+            error: `Token exchange failed (${response.status}): ${text.slice(0, 200)}`,
+          }),
+        );
+        return;
+      }
+
+      const json = (await response.json()) as {
+        access_token: string;
+        refresh_token: string;
+        expires_in: number;
+      };
+      const multiAuth = loadMultiAuth();
+      multiAuth.accounts ??= [];
+      const updated = {
+        name: alias,
+        access: json.access_token,
+        refresh: json.refresh_token,
+        expires: Date.now() + json.expires_in * 1000,
+        type: "oauth",
+      };
+      const idx = multiAuth.accounts.findIndex((a: any) => a.name === alias);
+      if (idx >= 0) {
+        multiAuth.accounts[idx] = updated;
+      } else {
+        multiAuth.accounts.push(updated);
+      }
+      saveMultiAuth(multiAuth);
+      console.log(JSON.stringify({ status: "ok", alias }));
+      return;
+    }
+
+    if (jsonMode && !callbackUrl) {
+      // Legacy step 1: generate auth URL (scripting mode)
       const pkce = await generatePKCE();
       const state = generateState();
       const url = new URL(AUTHORIZE_URLS.max);
@@ -1312,46 +1699,100 @@ async function cmdReauth(
       return;
     }
 
-    // Step 2: Exchange callback URL for tokens
-    if (!verifier) {
-      console.log(
-        JSON.stringify({
-          status: "error",
-          alias,
-          error: "Missing --verifier. Use the verifier from step 1.",
-        }),
-      );
+    // Interactive mode
+    console.log(`\n  \ud83d\udd10 Re-authenticating: ${alias}`);
+    console.log(
+      "  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n",
+    );
+    console.log("  Choose authentication method:");
+    console.log("    1. Claude Pro/Max (OAuth)");
+    console.log("    2. Manually enter API Key\n");
+
+    const method = await prompt("  ? Select method (1): ");
+    const choice = method.trim() || "1";
+
+    if (choice === "2") {
+      // Manual API key
+      const apiKey = await prompt("  ? Enter your API key: ");
+      if (!apiKey) {
+        console.error("\n  \u274c No API key provided\n");
+        return;
+      }
+
+      const multiAuth = loadMultiAuth();
+      multiAuth.accounts ??= [];
+      const updated: any = {
+        name: alias,
+        apiKey,
+        type: "api_key",
+      };
+      // Clear OAuth fields
+      delete updated.access;
+      delete updated.refresh;
+      delete updated.expires;
+
+      const idx = multiAuth.accounts.findIndex((a: any) => a.name === alias);
+      if (idx >= 0) {
+        multiAuth.accounts[idx] = updated;
+      } else {
+        multiAuth.accounts.push(updated);
+      }
+      saveMultiAuth(multiAuth);
+      console.log(`\n  \u2705 API key saved for '${alias}'\n`);
       return;
     }
 
+    // OAuth flow
+    const pkce = await generatePKCE();
+    const state = generateState();
+
+    const url = new URL(AUTHORIZE_URLS.max);
+    url.searchParams.set("code", "true");
+    url.searchParams.set("client_id", CLIENT_ID);
+    url.searchParams.set("response_type", "code");
+    url.searchParams.set("redirect_uri", CODE_CALLBACK_URL);
+    url.searchParams.set("scope", OAUTH_SCOPES.join(" "));
+    url.searchParams.set("code_challenge", pkce.challenge);
+    url.searchParams.set("code_challenge_method", "S256");
+    url.searchParams.set("state", state);
+
+    console.log("\n  Step 1: Open this URL in your browser:\n");
+    console.log(`    ${url.toString()}\n`);
+    console.log("  Step 2: Log in and authorize");
+    console.log("  Step 3: Paste the callback URL or code below\n");
+
+    const input = await prompt("  ? Paste here: ");
+
     let code: string;
     try {
-      const parsed = new URL(callbackUrl);
-      code = parsed.searchParams.get("code") || callbackUrl;
+      const parsed = new URL(input);
+      code = parsed.searchParams.get("code") || input;
     } catch {
-      code = callbackUrl;
+      code = input;
     }
+
+    console.log("\n  \u231b Exchanging tokens...");
 
     const response = await fetch(
       TOKEN_URL,
       createOAuthTokenRequestInit({
         code,
-        state: verifier,
+        state: state,
         grant_type: "authorization_code",
         client_id: CLIENT_ID,
         redirect_uri: CODE_CALLBACK_URL,
-        code_verifier: verifier,
+        code_verifier: pkce.verifier,
       }),
     );
 
     if (!response.ok) {
       const text = await response.text();
-      console.log(
-        JSON.stringify({
-          status: "error",
-          alias,
-          error: `Token exchange failed (${response.status}): ${text.slice(0, 200)}`,
-        }),
+      console.error(
+        `\n  \u274c Token exchange failed (HTTP ${response.status})`,
+      );
+      console.error(`     ${text.slice(0, 200)}`);
+      console.error(
+        "     \ud83d\udca1 Try again or use a fresh authorization URL\n",
       );
       return;
     }
@@ -1368,6 +1809,7 @@ async function cmdReauth(
       access: json.access_token,
       refresh: json.refresh_token,
       expires: Date.now() + json.expires_in * 1000,
+      type: "oauth",
     };
     const idx = multiAuth.accounts.findIndex((a: any) => a.name === alias);
     if (idx >= 0) {
@@ -1376,9 +1818,19 @@ async function cmdReauth(
       multiAuth.accounts.push(updated);
     }
     saveMultiAuth(multiAuth);
-    console.log(JSON.stringify({ status: "ok", alias }));
+
+    const expiresMin = Math.round(json.expires_in / 60);
+    console.log(`  \u2705 Account '${alias}' re-authenticated`);
+    console.log(`     Expires in ${expiresMin} minutes\n`);
+    console.log(`  Run: bun src/cli.ts test ${alias}    Verify connectivity\n`);
   } catch (err) {
-    console.log(JSON.stringify({ status: "error", alias, error: String(err) }));
+    if (jsonMode) {
+      console.log(
+        JSON.stringify({ status: "error", alias, error: String(err) }),
+      );
+    } else {
+      console.error(`\n  \u274c Error: ${String(err)}\n`);
+    }
   }
 }
 
@@ -1475,18 +1927,25 @@ function cmdList() {
 
   accounts.forEach((account: any, i: number) => {
     const isActive = state.currentAccount === account.name;
-    const status = account.expires > Date.now() ? "✅ Valid" : "⚠️  Expired";
+    const isApiKey = account.type === "api_key";
+    const status = isApiKey
+      ? "\u2705 API Key"
+      : account.expires > Date.now()
+        ? "\u2705 Valid"
+        : "\u26a0\ufe0f  Expired";
     const role = i === 0 ? "primary" : "fallback";
-    const activeTag = isActive ? " ◄" : "";
+    const activeTag = isActive ? " \u25c4" : "";
 
     let expiresStr = "";
-    if (account.expires > Date.now()) {
+    if (isApiKey) {
+      expiresStr = "\u221e";
+    } else if (account.expires > Date.now()) {
       const minsLeft = Math.floor((account.expires - Date.now()) / 60000);
       const hoursLeft = Math.floor(minsLeft / 60);
       const mins = minsLeft % 60;
       expiresStr = `${hoursLeft}h ${mins}m`;
     } else {
-      expiresStr = "—";
+      expiresStr = "\u2014";
     }
 
     console.log(
@@ -1497,8 +1956,10 @@ function cmdList() {
   console.log(`\n  ────────────────────────────────────────`);
   console.log(`  ${accounts.length} account(s) configured`);
 
-  // Show fix hints for expired accounts
-  const expired = accounts.filter((a: any) => a.expires <= Date.now());
+  // Show fix hints for expired accounts (skip API key accounts - they don't expire)
+  const expired = accounts.filter(
+    (a: any) => a.type !== "api_key" && a.expires <= Date.now(),
+  );
   if (expired.length > 0) {
     console.log(`\n  ⚠️  ${expired.length} account(s) have expired tokens:`);
     expired.forEach((a: any) => {
@@ -1603,35 +2064,45 @@ async function cmdTest(name: string) {
   console.log(`\n  🔍 Testing Account: ${name}`);
   console.log("  ────────────────────────────────────────\n");
 
+  const isApiKey = account.type === "api_key";
   let passed = 0;
   const total = 3;
 
   // Step 1: Check token validity
   console.log("  1. Checking token validity...");
-  if (account.access && account.expires > Date.now()) {
+  if (isApiKey) {
+    console.log(`     \u2705 API key configured (does not expire)\n`);
+    passed++;
+  } else if (account.access && account.expires > Date.now()) {
     const minsLeft = Math.floor((account.expires - Date.now()) / 60000);
-    console.log(`     ✅ Token valid (expires in ${minsLeft} min)\n`);
+    console.log(`     \u2705 Token valid (expires in ${minsLeft} min)\n`);
     passed++;
   } else {
-    console.log("     ⚠️  Token expired, attempting refresh...");
+    console.log("     \u26a0\ufe0f  Token expired, attempting refresh...");
     const refreshError = await refreshToken(account);
     if (refreshError) {
-      console.log(`     ❌ Refresh failed: ${refreshError}`);
+      console.log(`     \u274c Refresh failed: ${refreshError}`);
       console.log(`     Run: bun src/cli.ts reauth ${name}\n`);
-      console.log(`  ────────────────────────────────────────`);
-      console.log(`  ❌ Result: ${passed}/${total} checks passed\n`);
+      console.log(
+        `  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500`,
+      );
+      console.log(`  \u274c Result: ${passed}/${total} checks passed\n`);
       return;
     }
-    console.log("     ✅ Token refreshed successfully\n");
+    console.log("     \u2705 Token refreshed successfully\n");
     passed++;
   }
 
   // Step 2: Send test request (inline ping)
   console.log("  2. Sending API test request...");
+  const authHeaders: Record<string, string> = isApiKey
+    ? { "x-api-key": account.apiKey }
+    : { authorization: `Bearer ${account.access}` };
+
   const res = await fetch("https://api.anthropic.com/v1/messages?beta=true", {
     method: "POST",
     headers: {
-      authorization: `Bearer ${account.access}`,
+      ...authHeaders,
       "anthropic-beta": REQUIRED_BETAS.join(","),
       "user-agent": CLAUDE_CLI_USER_AGENT,
       "content-type": "application/json",
@@ -1708,9 +2179,14 @@ function cmdDiagnose() {
   } else {
     console.log(`    ✅ Found ${multiAuth.accounts.length} account(s)`);
     multiAuth.accounts.forEach((account: any, i: number) => {
-      const isExpired = account.expires <= Date.now();
-      const status = isExpired ? "⚠️  Expired" : "✅ Valid";
-      console.log(`       ${i + 1}. ${account.name} — ${status}`);
+      const isApiKey = account.type === "api_key";
+      const isExpired = !isApiKey && account.expires <= Date.now();
+      const status = isApiKey
+        ? "\u2705 API Key"
+        : isExpired
+          ? "\u26a0\ufe0f  Expired"
+          : "\u2705 Valid";
+      console.log(`       ${i + 1}. ${account.name} \u2014 ${status}`);
       if (isExpired) {
         console.log(`          Run: bun src/cli.ts reauth ${account.name}`);
         issues++;
@@ -1977,8 +2453,9 @@ function showHelp() {
   Manage multiple Anthropic Max accounts with automatic failover.
 
   ACCOUNT MANAGEMENT
-    add <name>              Add a new account via OAuth
-    reauth <name>           Re-authenticate an existing account
+    add <name>              Add account (OAuth or API key)
+    reauth <name>           Re-authenticate account
+    reauth <name> --json    Re-authenticate (JSON output for scripting)
     list, ls                List all configured accounts
     set-primary <name>      Set an account as the primary
     remove, rm <name>       Remove an account
@@ -1993,13 +2470,15 @@ function showHelp() {
     switch <name>           Force switch to a specific account
 
   CONFIGURATION
-    config                  Show current configuration
-    config --threshold 0.8  Set all thresholds (0-1)
-    config --thresholds 95,80,90
-                            Set session, weekly, sonnet thresholds
-    config --interval 30    Set recovery check interval (minutes)
-    config --reset          Reset to defaults
-    config-interactive      Interactive configuration wizard
+    config                           Show global configuration
+    config --account <name>          Show account-specific config
+    config --account <name> --threshold 0.95
+                                     Set per-account threshold
+    config --threshold 0.8           Set all global thresholds (0-1)
+    config --thresholds 95,80,90     Set session, weekly, sonnet thresholds
+    config --interval 30             Set recovery check interval (minutes)
+    config --reset                   Reset to defaults
+    config-interactive               Interactive configuration wizard
 
   OTHER
     migrate                 Assist with version migration
@@ -2007,10 +2486,12 @@ function showHelp() {
     version, --version      Show version number
 
   EXAMPLES
-    bun src/cli.ts add primary          Add your first account
-    bun src/cli.ts usage --watch        Live usage dashboard
-    bun src/cli.ts switch fallback1     Force switch to fallback1
-    bun src/cli.ts config --thresholds 95,80,90
+    bun src/cli.ts add primary                       Add your first account
+    bun src/cli.ts usage --watch                     Live usage dashboard
+    bun src/cli.ts switch fallback1                  Force switch to fallback1
+    bun src/cli.ts config --thresholds 95,80,90      Set global thresholds
+    bun src/cli.ts config --account primary --threshold 0.95
+                                                     Set per-account threshold
 `);
 }
 
@@ -2040,7 +2521,7 @@ async function main() {
       await cmdAdd(rest);
       break;
     case "reauth":
-      await cmdReauth(rest[0], rest[1], rest[2]);
+      await cmdReauth(rest[0], rest.slice(1));
       break;
     case "ping":
       await cmdPing(rest[0], rest.includes("--json"));

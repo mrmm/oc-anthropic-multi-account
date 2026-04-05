@@ -440,6 +440,24 @@ function normalizeThresholds(value, fallback) {
   return { session5h: fallback, weekly7d: fallback, weekly7dSonnet: fallback };
 }
 
+/**
+ * Resolve thresholds for a specific account, merging per-account overrides with global defaults.
+ * @param {string} accountName
+ * @param {object} config - state.config
+ */
+function getAccountThresholds(accountName, config) {
+  const globalThreshold = normalizeThresholds(config?.threshold, 0.70);
+  const accountConfig = config?.accounts?.[accountName];
+  if (!accountConfig?.threshold) return globalThreshold;
+
+  const accountThreshold = normalizeThresholds(accountConfig.threshold, undefined);
+  return {
+    session5h: accountThreshold.session5h ?? globalThreshold.session5h,
+    weekly7d: accountThreshold.weekly7d ?? globalThreshold.weekly7d,
+    weekly7dSonnet: accountThreshold.weekly7dSonnet ?? globalThreshold.weekly7dSonnet,
+  };
+}
+
 const EMPTY_USAGE = {
   session5h: { utilization: 0, reset: null, status: 'allowed' },
   weekly7d: { utilization: 0, reset: null, status: 'allowed' },
@@ -482,7 +500,6 @@ function resolveStaleMetrics(state) {
 
 function selectThresholdAccount(accounts, state) {
   const config = state?.config || {};
-  const thresholds = normalizeThresholds(config.threshold, 0.70);
   const CHECK_INTERVAL = config.checkInterval ?? 3600000;
   const now = Date.now();
   const authFailures = state?.authFailures || {};
@@ -502,31 +519,34 @@ function selectThresholdAccount(accounts, state) {
     return primary;
   }
 
-  function isOverThreshold(usage) {
+  function isOverThreshold(accountName, usage) {
     if (!usage) return false;
+    const t = getAccountThresholds(accountName, config);
     return (
-      (usage.session5h?.utilization || 0) > thresholds.session5h ||
-      (usage.weekly7d?.utilization || 0) > thresholds.weekly7d ||
-      (usage.weekly7dSonnet?.utilization || 0) > thresholds.weekly7dSonnet
+      (usage.session5h?.utilization || 0) > t.session5h ||
+      (usage.weekly7d?.utilization || 0) > t.weekly7d ||
+      (usage.weekly7dSonnet?.utilization || 0) > t.weekly7dSonnet
     );
   }
 
-  function getExceededMetric(usage) {
+  function getExceededMetric(accountName, usage) {
     if (!usage) return { name: 'unknown', value: 0, threshold: 1 };
+    const t = getAccountThresholds(accountName, config);
     const metrics = [
-      { name: 'session (5h)', value: usage.session5h?.utilization || 0, threshold: thresholds.session5h },
-      { name: 'weekly (all)', value: usage.weekly7d?.utilization || 0, threshold: thresholds.weekly7d },
-      { name: 'weekly (Sonnet)', value: usage.weekly7dSonnet?.utilization || 0, threshold: thresholds.weekly7dSonnet }
+      { name: 'session (5h)', value: usage.session5h?.utilization || 0, threshold: t.session5h },
+      { name: 'weekly (all)', value: usage.weekly7d?.utilization || 0, threshold: t.weekly7d },
+      { name: 'weekly (Sonnet)', value: usage.weekly7dSonnet?.utilization || 0, threshold: t.weekly7dSonnet }
     ];
     return metrics.reduce((max, m) => (m.value / m.threshold) > (max.value / max.threshold) ? m : max);
   }
 
-  function getUtilizationScore(usage) {
+  function getUtilizationScore(accountName, usage) {
     if (!usage) return 0;
+    const t = getAccountThresholds(accountName, config);
     return Math.max(
-      (usage.session5h?.utilization || 0) / thresholds.session5h,
-      (usage.weekly7d?.utilization || 0) / thresholds.weekly7d,
-      (usage.weekly7dSonnet?.utilization || 0) / thresholds.weekly7dSonnet
+      (usage.session5h?.utilization || 0) / t.session5h,
+      (usage.weekly7d?.utilization || 0) / t.weekly7d,
+      (usage.weekly7dSonnet?.utilization || 0) / t.weekly7dSonnet
     );
   }
 
@@ -534,11 +554,11 @@ function selectThresholdAccount(accounts, state) {
   const currentIsPrimary = state.currentAccount === primary.name;
 
   if (currentIsPrimary) {
-    if (isOverThreshold(primaryUsage)) {
+    if (isOverThreshold(primary.name, primaryUsage)) {
       for (const fallback of fallbacks) {
         const fallbackUsage = state.usage?.[fallback.name];
-        if (!isOverThreshold(fallbackUsage) && !isTemporarilyUnavailable(fallback.name)) {
-          const exceeded = getExceededMetric(primaryUsage);
+        if (!isOverThreshold(fallback.name, fallbackUsage) && !isTemporarilyUnavailable(fallback.name)) {
+          const exceeded = getExceededMetric(primary.name, primaryUsage);
           console.log(`[multi-account] ${primary.name} → ${fallback.name}: ${exceeded.name} at ${Math.round(exceeded.value * 100)}% (threshold ${Math.round(exceeded.threshold * 100)}%)`);
           return fallback;
         }
@@ -546,9 +566,9 @@ function selectThresholdAccount(accounts, state) {
       const availableFallbacks = fallbacks.filter((fallback) => !isTemporarilyUnavailable(fallback.name));
       const pool = availableFallbacks.length > 0 ? availableFallbacks : fallbacks;
       const best = pool.reduce((lowest, f) => {
-        return getUtilizationScore(state.usage?.[f.name]) < getUtilizationScore(state.usage?.[lowest.name]) ? f : lowest;
+        return getUtilizationScore(f.name, state.usage?.[f.name]) < getUtilizationScore(lowest.name, state.usage?.[lowest.name]) ? f : lowest;
       }, pool[0]);
-      const exceeded = getExceededMetric(primaryUsage);
+      const exceeded = getExceededMetric(primary.name, primaryUsage);
       console.log(`[multi-account] ${primary.name} → ${best.name}: ${exceeded.name} at ${Math.round(exceeded.value * 100)}% (all accounts busy)`);
       return best;
     }
@@ -574,7 +594,7 @@ function selectThresholdAccount(accounts, state) {
     if (resetPassed || intervalPassed) {
       state.lastPrimaryCheck = now;
       
-      if (!isOverThreshold(primaryUsage)) {
+      if (!isOverThreshold(primary.name, primaryUsage)) {
         console.log(`[multi-account] → ${primary.name}: under threshold, switching back`);
         return primary;
       }
@@ -593,6 +613,11 @@ function selectThresholdAccount(accounts, state) {
 let refreshPromise = null;
 
 async function ensureFreshAccountToken(account, multiAuth) {
+  // API key accounts don't need token refresh
+  if (account.type === "api_key" && account.apiKey) {
+    return { ok: true };
+  }
+
   if (account.access && account.expires > Date.now()) {
     return { ok: true };
   }
@@ -934,7 +959,16 @@ export async function AnthropicAuthPlugin({ client }) {
 
               const requestInit = init ?? {};
               const requestHeaders = mergeHeaders(input, init);
-              setOAuthHeaders(requestHeaders, account.access);
+
+              // Set auth headers based on account type
+              if (account.type === "api_key" && account.apiKey) {
+                requestHeaders.set("x-api-key", account.apiKey);
+                requestHeaders.set("anthropic-beta", mergeBetaHeaders(requestHeaders));
+                requestHeaders.set("user-agent", CLAUDE_CLI_USER_AGENT);
+                requestHeaders.delete("authorization");
+              } else {
+                setOAuthHeaders(requestHeaders, account.access);
+              }
 
               let body = requestInit.body;
               if (body && typeof body === "string") {
@@ -960,7 +994,14 @@ export async function AnthropicAuthPlugin({ client }) {
 
               while (true) {
                 attemptedRequestAccounts.add(account.name);
-                requestHeaders.set("authorization", `Bearer ${account.access}`);
+                // Update auth headers for current account
+                if (account.type === "api_key" && account.apiKey) {
+                  requestHeaders.set("x-api-key", account.apiKey);
+                  requestHeaders.delete("authorization");
+                } else {
+                  requestHeaders.set("authorization", `Bearer ${account.access}`);
+                  requestHeaders.delete("x-api-key");
+                }
 
                 response = await fetch(requestInput, {
                   ...requestInit,
