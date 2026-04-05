@@ -1214,6 +1214,9 @@ async function cmdAdd(args: string[]) {
     const account = {
       id: crypto.randomUUID(),
       name,
+      email: null as string | null,
+      org: null as string | null,
+      plan: null as string | null,
       access: json.access_token,
       refresh: json.refresh_token,
       expires: Date.now() + json.expires_in * 1000,
@@ -1223,6 +1226,9 @@ async function cmdAdd(args: string[]) {
 
     if (idx >= 0) {
       account.id = data.accounts[idx].id || account.id;
+      account.email = data.accounts[idx].email || null;
+      account.org = data.accounts[idx].org || null;
+      account.plan = data.accounts[idx].plan || null;
       data.accounts[idx] = account;
       console.log(`\n  \u2705 Account '${name}' updated`);
     } else {
@@ -1258,6 +1264,9 @@ async function cmdAdd(args: string[]) {
     const account = {
       id: crypto.randomUUID(),
       name,
+      email: null as string | null,
+      org: null as string | null,
+      plan: null as string | null,
       apiKey,
       type: "api_key",
     };
@@ -1265,6 +1274,9 @@ async function cmdAdd(args: string[]) {
 
     if (idx >= 0) {
       account.id = data.accounts[idx].id || account.id;
+      account.email = data.accounts[idx].email || null;
+      account.org = data.accounts[idx].org || null;
+      account.plan = data.accounts[idx].plan || null;
       data.accounts[idx] = account;
       console.log(`\n  \u2705 Account '${name}' updated with API key`);
     } else {
@@ -1346,6 +1358,9 @@ async function cmdAdd(args: string[]) {
   const account = {
     id: crypto.randomUUID(),
     name,
+    email: null as string | null,
+    org: null as string | null,
+    plan: null as string | null,
     access: json.access_token,
     refresh: json.refresh_token,
     expires: Date.now() + json.expires_in * 1000,
@@ -1355,6 +1370,9 @@ async function cmdAdd(args: string[]) {
 
   if (idx >= 0) {
     account.id = data.accounts[idx].id || account.id;
+    account.email = data.accounts[idx].email || null;
+    account.org = data.accounts[idx].org || null;
+    account.plan = data.accounts[idx].plan || null;
     data.accounts[idx] = account;
     console.log(`\n  \u2705 Account '${name}' updated`);
   } else {
@@ -1494,6 +1512,311 @@ function formatQuotaLine(label: string, metric: QuotaMetric | null): string {
   const reset = metric.reset ? `resets ${formatResetTime(metric.reset)}` : "";
   return `  ${label.padEnd(17)}${pctStr}  ${bar}  \x1b[2m${reset}\x1b[0m`;
 }
+
+// ============================================================================
+// Token consumption & extra credit (shared with index.mjs)
+// ============================================================================
+
+const MODEL_PRICING: Record<string, [number, number]> = {
+  haiku: [1.0, 5.0],
+  sonnet: [3.0, 15.0],
+  opus: [15.0, 75.0],
+};
+
+function getModelPricing(model: string): [number, number] {
+  const m = model.toLowerCase();
+  if (m.includes("haiku")) return MODEL_PRICING.haiku;
+  if (m.includes("opus")) return MODEL_PRICING.opus;
+  return MODEL_PRICING.sonnet;
+}
+
+function calculateCost(model: string, input: number, output: number): number {
+  const [inputPrice, outputPrice] = getModelPricing(model);
+  return (input * inputPrice + output * outputPrice) / 1_000_000;
+}
+
+function detectExtraCredit(usage: any) {
+  for (const key of ["session5h", "weekly7d", "weekly7dSonnet"] as const) {
+    const m = usage?.[key];
+    if (m && m.utilization >= 1.0 && m.status === "allowed") {
+      if (!usage.extraCredit?.detected) {
+        usage.extraCredit = {
+          detected: true,
+          detectedAt: new Date().toISOString(),
+          metric: key,
+          tokens: { input: 0, output: 0 },
+          estimatedCost: 0,
+        };
+      }
+      return;
+    }
+  }
+  if (usage.extraCredit?.detected) {
+    usage.extraCredit.detected = false;
+  }
+}
+
+function formatNumber(n: number): string {
+  return n.toLocaleString("en-US");
+}
+
+function formatUSD(n: number): string {
+  return `$${n.toFixed(2)}`;
+}
+
+// ============================================================================
+// refresh command
+// ============================================================================
+
+const USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage";
+
+async function cmdRefresh(accountName?: string) {
+  const data = loadData();
+  const accounts = data.accounts || [];
+
+  const toRefresh = accountName
+    ? accounts.filter((a: any) => a.name === accountName)
+    : accounts;
+
+  if (!toRefresh.length) {
+    console.log(
+      accountName
+        ? `\n  ❌ Account '${accountName}' not found\n`
+        : "\n  ❌ No accounts configured\n",
+    );
+    return;
+  }
+
+  console.log("\n  🔄 Refreshing usage data...\n");
+
+  for (const account of toRefresh) {
+    if (account.type === "api_key") {
+      console.log(
+        `  ${account.name}: ⚠️  API key accounts — pinging for metrics`,
+      );
+      await cmdPing(account.name, false);
+      continue;
+    }
+
+    // Ensure fresh token
+    const refreshErr = await refreshToken(account);
+    if (refreshErr) {
+      console.log(`  ${account.name}: ❌ ${refreshErr}`);
+      continue;
+    }
+
+    try {
+      const res = await fetch(USAGE_ENDPOINT, {
+        headers: {
+          Authorization: `Bearer ${account.access}`,
+          "anthropic-version": "2023-06-01",
+          "anthropic-beta": "oauth-2025-04-20",
+          Accept: "application/json",
+        },
+      });
+
+      if (!res.ok) {
+        console.log(`  ${account.name}: ❌ Usage API returned ${res.status}`);
+        continue;
+      }
+
+      const json = (await res.json()) as Record<string, any>;
+
+      // Update usage data
+      data.usage[account.name] = data.usage[account.name] || {};
+      const usage = data.usage[account.name];
+
+      if (json.five_hour) {
+        usage.session5h = {
+          utilization: json.five_hour.utilization || 0,
+          reset: usage.session5h?.reset || null,
+          status: usage.session5h?.status || "allowed",
+        };
+      }
+      if (json.seven_day) {
+        usage.weekly7d = {
+          utilization: json.seven_day.utilization || 0,
+          reset: usage.weekly7d?.reset || null,
+          status: usage.weekly7d?.status || "allowed",
+        };
+      }
+      if (json.seven_day_sonnet) {
+        usage.weekly7dSonnet = {
+          utilization: json.seven_day_sonnet.utilization || 0,
+          reset: usage.weekly7dSonnet?.reset || null,
+          status: usage.weekly7dSonnet?.status || "allowed",
+        };
+      }
+
+      usage.timestamp = new Date().toISOString();
+      detectExtraCredit(usage);
+
+      // Display results
+      const s5h = usage.session5h?.utilization || 0;
+      const w7d = usage.weekly7d?.utilization || 0;
+      const wSnt = usage.weekly7dSonnet?.utilization || 0;
+      const ec = usage.extraCredit?.detected ? "  ⚡ EXTRA CREDIT" : "";
+
+      console.log(`  ${account.name}${ec}`);
+      console.log(`    Session (5h)     ${Math.round(s5h * 100)}%`);
+      console.log(`    Weekly (all)     ${Math.round(w7d * 100)}%`);
+      console.log(
+        `    Weekly (Sonnet)  ${wSnt ? Math.round(wSnt * 100) + "%" : "—"}`,
+      );
+      console.log();
+    } catch (err) {
+      console.log(`  ${account.name}: ❌ ${err}`);
+    }
+  }
+
+  saveData(data);
+  console.log("  ✅ Usage data refreshed\n");
+}
+
+// ============================================================================
+// costs command
+// ============================================================================
+
+function cmdCosts(accountName?: string, args: string[] = []) {
+  const data = loadData();
+  const accounts = data.accounts || [];
+
+  const sessionOnly = args.includes("--session");
+  const resetFlag = args.includes("--reset");
+
+  if (resetFlag) {
+    const target = accountName
+      ? accounts.filter((a: any) => a.name === accountName)
+      : accounts;
+    for (const account of target) {
+      if (data.usage?.[account.name]?.consumption) {
+        delete data.usage[account.name].consumption;
+      }
+    }
+    saveData(data);
+    console.log(
+      `\n  ✅ Consumption data reset${accountName ? ` for '${accountName}'` : ""}\n`,
+    );
+    return;
+  }
+
+  const target = accountName
+    ? accounts.filter((a: any) => a.name === accountName)
+    : accounts;
+
+  if (!target.length) {
+    console.log(
+      accountName
+        ? `\n  ❌ Account '${accountName}' not found\n`
+        : "\n  ❌ No accounts configured\n",
+    );
+    return;
+  }
+
+  console.log("\n  💰 Token Consumption");
+  console.log("  ────────────────────────────────────────\n");
+
+  for (const account of target) {
+    const usage = data.usage?.[account.name];
+    const consumption = usage?.consumption;
+
+    if (!consumption) {
+      console.log(`  ${account.name}: No consumption data yet`);
+      console.log(`    Run some queries to start tracking\n`);
+      continue;
+    }
+
+    const ec = usage.extraCredit?.detected ? " ⚡ EXTRA CREDIT" : "";
+    console.log(`  ${account.name}${ec}`);
+
+    if (sessionOnly) {
+      const s = consumption.currentSession;
+      console.log(
+        `    Session:  ${formatNumber(s.input)} in / ${formatNumber(s.output)} out  (${s.requests} reqs)  ${formatUSD(s.estimatedCost)}`,
+      );
+    } else {
+      const s = consumption.currentSession;
+      const m = consumption.currentMonth;
+      const a = consumption.allTime;
+
+      console.log(
+        `    Session:  ${formatNumber(s.input)} in / ${formatNumber(s.output)} out  (${s.requests} reqs)  ${formatUSD(s.estimatedCost)}`,
+      );
+      console.log(
+        `    Month:    ${formatNumber(m.input)} in / ${formatNumber(m.output)} out  (${m.requests} reqs)  ${formatUSD(m.estimatedCost)}`,
+      );
+      console.log(
+        `    All-time: ${formatNumber(a.input)} in / ${formatNumber(a.output)} out  (${a.requests} reqs)  ${formatUSD(a.estimatedCost)}`,
+      );
+
+      // Per-model breakdown
+      const models = Object.entries(consumption.byModel || {}) as [
+        string,
+        any,
+      ][];
+      if (models.length > 0) {
+        console.log(`\n    By model:`);
+        for (const [model, stats] of models) {
+          console.log(
+            `      ${model.padEnd(30)} ${formatNumber(stats.input)} in / ${formatNumber(stats.output)} out  ${formatUSD(stats.cost)}`,
+          );
+        }
+      }
+
+      // Extra credit info
+      if (usage.extraCredit?.detected && usage.extraCredit.estimatedCost > 0) {
+        console.log(
+          `\n    ⚡ Extra credit: ${formatUSD(usage.extraCredit.estimatedCost)} estimated cost since ${new Date(usage.extraCredit.detectedAt).toLocaleDateString()}`,
+        );
+      }
+
+      // Subscription value comparison
+      const plan = account.plan;
+      if (plan && m.estimatedCost > 0) {
+        const planPrice =
+          plan.price ||
+          (plan.type === "pro"
+            ? 20
+            : plan.type === "max5x"
+              ? 100
+              : plan.type === "max20x"
+                ? 200
+                : 0);
+        if (planPrice > 0) {
+          const valueRatio = Math.round((m.estimatedCost / planPrice) * 100);
+          console.log(
+            `\n    📊 Value: ${formatUSD(m.estimatedCost)} API equivalent / ${formatUSD(planPrice)} subscription (${valueRatio}%)`,
+          );
+
+          // Projection based on current rate
+          const monthStart = new Date(m.since);
+          const now = new Date();
+          const daysPassed = Math.max(
+            1,
+            (now.getTime() - monthStart.getTime()) / (1000 * 60 * 60 * 24),
+          );
+          const daysInMonth = new Date(
+            now.getFullYear(),
+            now.getMonth() + 1,
+            0,
+          ).getDate();
+          const projected =
+            Math.round((m.estimatedCost / daysPassed) * daysInMonth * 100) /
+            100;
+          console.log(
+            `    📈 Projected: ~${formatUSD(projected)} this month at current rate`,
+          );
+        }
+      }
+    }
+
+    console.log();
+  }
+}
+
+// ============================================================================
+// Ping command
+// ============================================================================
 
 async function cmdPing(alias: string, jsonMode: boolean = false) {
   try {
@@ -1735,8 +2058,12 @@ async function cmdReauth(alias: string, args: string[]) {
       };
       const reauthData = loadData();
       reauthData.accounts ??= [];
-      const updated = {
+      const updated: any = {
+        id: crypto.randomUUID(),
         name: alias,
+        email: null,
+        org: null,
+        plan: null,
         access: json.access_token,
         refresh: json.refresh_token,
         expires: Date.now() + json.expires_in * 1000,
@@ -1744,11 +2071,12 @@ async function cmdReauth(alias: string, args: string[]) {
       };
       const idx = reauthData.accounts.findIndex((a: any) => a.name === alias);
       if (idx >= 0) {
-        (updated as any).id =
-          reauthData.accounts[idx].id || crypto.randomUUID();
+        updated.id = reauthData.accounts[idx].id || updated.id;
+        updated.email = reauthData.accounts[idx].email || null;
+        updated.org = reauthData.accounts[idx].org || null;
+        updated.plan = reauthData.accounts[idx].plan || null;
         reauthData.accounts[idx] = updated;
       } else {
-        (updated as any).id = crypto.randomUUID();
         reauthData.accounts.push(updated);
       }
       saveData(reauthData);
@@ -1813,6 +2141,9 @@ async function cmdReauth(alias: string, args: string[]) {
       const updated: any = {
         id: crypto.randomUUID(),
         name: alias,
+        email: null,
+        org: null,
+        plan: null,
         apiKey,
         type: "api_key",
       };
@@ -1822,6 +2153,9 @@ async function cmdReauth(alias: string, args: string[]) {
       );
       if (idx >= 0) {
         updated.id = reauthApiData.accounts[idx].id || updated.id;
+        updated.email = reauthApiData.accounts[idx].email || null;
+        updated.org = reauthApiData.accounts[idx].org || null;
+        updated.plan = reauthApiData.accounts[idx].plan || null;
         reauthApiData.accounts[idx] = updated;
       } else {
         reauthApiData.accounts.push(updated);
@@ -1898,8 +2232,12 @@ async function cmdReauth(alias: string, args: string[]) {
     };
     const reauthOauthData = loadData();
     reauthOauthData.accounts ??= [];
-    const updated = {
+    const updated: any = {
+      id: crypto.randomUUID(),
       name: alias,
+      email: null,
+      org: null,
+      plan: null,
       access: json.access_token,
       refresh: json.refresh_token,
       expires: Date.now() + json.expires_in * 1000,
@@ -1909,11 +2247,12 @@ async function cmdReauth(alias: string, args: string[]) {
       (a: any) => a.name === alias,
     );
     if (idx >= 0) {
-      (updated as any).id =
-        reauthOauthData.accounts[idx].id || crypto.randomUUID();
+      updated.id = reauthOauthData.accounts[idx].id || updated.id;
+      updated.email = reauthOauthData.accounts[idx].email || null;
+      updated.org = reauthOauthData.accounts[idx].org || null;
+      updated.plan = reauthOauthData.accounts[idx].plan || null;
       reauthOauthData.accounts[idx] = updated;
     } else {
-      (updated as any).id = crypto.randomUUID();
       reauthOauthData.accounts.push(updated);
     }
     saveData(reauthOauthData);
@@ -2450,7 +2789,7 @@ async function cmdConfigInteractive() {
     `  Weekly (Sonnet) threshold %  [${Math.round(currentThresholds.weekly7dSonnet * 100)}]: `,
   );
   const interval = await ask(
-    `  Check interval (minutes)  [${(state.config.checkInterval || DEFAULTS.checkInterval) / 60000}]: `,
+    `  Check interval (minutes)  [${(data.config.checkInterval || DEFAULTS.checkInterval) / 60000}]: `,
   );
 
   // Parse and validate
@@ -2565,6 +2904,10 @@ function showHelp() {
 
   MONITORING
     usage, u [--watch]      Show rate limit usage dashboard
+    refresh [<name>]        Refresh usage data from API
+    costs [<name>]          Show token consumption and costs
+    costs --session         Show current session only
+    costs --reset           Reset consumption counters
     test <name>             Test account connectivity and quotas
     ping <name> [--json]    Ping account (human-readable, or JSON with --json)
     diagnose                Run system diagnostics
@@ -2628,6 +2971,12 @@ async function main() {
       break;
     case "ping":
       await cmdPing(rest[0], rest.includes("--json"));
+      break;
+    case "refresh":
+      await cmdRefresh(rest[0]);
+      break;
+    case "costs":
+      cmdCosts(rest[0], rest);
       break;
     case "test":
       await cmdTest(rest[0]);

@@ -491,6 +491,99 @@ const EMPTY_USAGE = {
 
 const AUTH_FAILURE_COOLDOWN = 60 * 60 * 1000;
 
+// ---------------------------------------------------------------------------
+// Token consumption tracking & extra credit detection
+// ---------------------------------------------------------------------------
+
+const MODEL_PRICING = {
+  // Per million tokens [input, output]
+  "haiku": [1.00, 5.00],
+  "sonnet": [3.00, 15.00],
+  "opus": [15.00, 75.00],
+};
+
+function getModelPricing(model) {
+  const m = model.toLowerCase();
+  if (m.includes("haiku")) return MODEL_PRICING.haiku;
+  if (m.includes("opus")) return MODEL_PRICING.opus;
+  return MODEL_PRICING.sonnet; // default
+}
+
+function calculateCost(model, input, output) {
+  const [inputPrice, outputPrice] = getModelPricing(model);
+  return (input * inputPrice + output * outputPrice) / 1_000_000;
+}
+
+function trackConsumption(accountName, model, inputTokens, outputTokens, data) {
+  const usage = data.usage[accountName];
+  if (!usage) return;
+
+  usage.consumption = usage.consumption || {
+    allTime: { input: 0, output: 0, requests: 0, estimatedCost: 0, since: new Date().toISOString() },
+    currentMonth: { input: 0, output: 0, requests: 0, estimatedCost: 0, since: new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString() },
+    currentSession: { input: 0, output: 0, requests: 0, estimatedCost: 0, since: new Date().toISOString() },
+    byModel: {}
+  };
+
+  // Check month rollover
+  const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString();
+  if (usage.consumption.currentMonth.since !== monthStart.slice(0, 7) &&
+      !usage.consumption.currentMonth.since?.startsWith(monthStart.slice(0, 7))) {
+    usage.consumption.currentMonth = { input: 0, output: 0, requests: 0, estimatedCost: 0, since: monthStart };
+  }
+
+  const cost = calculateCost(model, inputTokens, outputTokens);
+
+  // Update all levels
+  for (const level of [usage.consumption.allTime, usage.consumption.currentMonth, usage.consumption.currentSession]) {
+    level.input += inputTokens;
+    level.output += outputTokens;
+    level.requests += 1;
+    level.estimatedCost = Math.round((level.estimatedCost + cost) * 100) / 100;
+  }
+
+  // By model
+  const modelKey = model;
+  usage.consumption.byModel[modelKey] = usage.consumption.byModel[modelKey] || { input: 0, output: 0, cost: 0 };
+  usage.consumption.byModel[modelKey].input += inputTokens;
+  usage.consumption.byModel[modelKey].output += outputTokens;
+  usage.consumption.byModel[modelKey].cost = Math.round(
+    (usage.consumption.byModel[modelKey].cost + cost) * 100
+  ) / 100;
+
+  // Extra credit tracking
+  if (usage.extraCredit?.detected) {
+    usage.extraCredit.tokens = usage.extraCredit.tokens || { input: 0, output: 0 };
+    usage.extraCredit.tokens.input += inputTokens;
+    usage.extraCredit.tokens.output += outputTokens;
+    usage.extraCredit.estimatedCost = Math.round(
+      (usage.extraCredit.estimatedCost + cost) * 100
+    ) / 100;
+  }
+}
+
+function detectExtraCredit(usage) {
+  for (const key of ['session5h', 'weekly7d', 'weekly7dSonnet']) {
+    const m = usage?.[key];
+    if (m && m.utilization >= 1.0 && m.status === 'allowed') {
+      if (!usage.extraCredit?.detected) {
+        usage.extraCredit = {
+          detected: true,
+          detectedAt: new Date().toISOString(),
+          metric: key,
+          tokens: { input: 0, output: 0 },
+          estimatedCost: 0,
+        };
+      }
+      return;
+    }
+  }
+  // Reset if no longer in extra credit
+  if (usage.extraCredit?.detected) {
+    usage.extraCredit.detected = false;
+  }
+}
+
 function ensureAllAccountsInState(accounts, state) {
   if (!accounts?.length) return false;
   state.usage = state.usage || {};
@@ -1103,14 +1196,31 @@ export async function AnthropicAuthPlugin({ client }) {
               }
 
               data.usage[account.name] = {
+                ...data.usage[account.name],
                 session5h: updateMetric(prev.session5h, 'anthropic-ratelimit-unified-5h'),
                 weekly7d: updateMetric(prev.weekly7d, 'anthropic-ratelimit-unified-7d'),
                 weekly7dSonnet: updateMetric(prev.weekly7dSonnet, 'anthropic-ratelimit-unified-7d_sonnet'),
                 timestamp: new Date().toISOString()
               };
 
+              // Detect extra credit state
+              detectExtraCredit(data.usage[account.name]);
+
               // Save consolidated data
               saveData(data);
+
+              // Track token consumption from response body
+              try {
+                const cloned = response.clone();
+                const respBody = await cloned.json().catch(() => null);
+                if (respBody?.usage) {
+                  const model = respBody.model || "unknown";
+                  const inputTokens = respBody.usage.input_tokens || 0;
+                  const outputTokens = respBody.usage.output_tokens || 0;
+                  trackConsumption(account.name, model, inputTokens, outputTokens, data);
+                  saveData(data);
+                }
+              } catch {}
 
               // Transform streaming response to strip tool prefixes
               return createStrippedStream(response);
@@ -1182,6 +1292,23 @@ export async function AnthropicAuthPlugin({ client }) {
                 body,
                 headers: requestHeaders,
               });
+
+              // Track token consumption for single-account mode
+              try {
+                const cloned = response.clone();
+                const respBody = await cloned.json().catch(() => null);
+                if (respBody?.usage) {
+                  const singleData = loadData();
+                  const accountName = singleData.accounts?.[0]?.name || "_single";
+                  singleData.usage = singleData.usage || {};
+                  singleData.usage[accountName] = singleData.usage[accountName] || {};
+                  const model = respBody.model || "unknown";
+                  const inputTokens = respBody.usage.input_tokens || 0;
+                  const outputTokens = respBody.usage.output_tokens || 0;
+                  trackConsumption(accountName, model, inputTokens, outputTokens, singleData);
+                  saveData(singleData);
+                }
+              } catch {}
 
               // Transform streaming response to strip tool prefixes
               return createStrippedStream(response);
