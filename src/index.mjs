@@ -851,10 +851,18 @@ function ensureAllAccountsInState(accounts, state) {
   return changed;
 }
 
+const SWITCH_LOG_FILE = require("path").join(require("os").homedir(), ".config/opencode/anthropic-multi-account-switches.log");
+
 function logSwitch(data, from, to, reason) {
+  const ts = new Date().toISOString();
   if (!data.switchHistory) data.switchHistory = [];
-  data.switchHistory.push({ ts: new Date().toISOString(), from, to, reason });
+  data.switchHistory.push({ ts, from, to, reason });
   if (data.switchHistory.length > 50) data.switchHistory = data.switchHistory.slice(-50);
+  // Append to dedicated log file
+  try {
+    const line = `${ts}  ${from} → ${to}  [${reason}]\n`;
+    require("fs").appendFileSync(SWITCH_LOG_FILE, line);
+  } catch {}
 }
 
 function resolveStaleMetrics(state) {
@@ -1357,6 +1365,7 @@ export async function AnthropicAuthPlugin({ client, directory, worktree }) {
                    throw new Error(`Token refresh failed for ${account.name}: ${refreshResult.status}`);
                  }
 
+                 logSwitch(data, account.name, fallback.name, "token refresh failed");
                  console.warn(`[multi-account] refresh failed for ${account.name} (${refreshResult.status}), trying ${fallback.name}`);
                  account = fallback;
                  data.currentAccount = account.name;
@@ -1433,6 +1442,7 @@ export async function AnthropicAuthPlugin({ client, directory, worktree }) {
                   );
 
                   if (rateLimitAccount) {
+                    logSwitch(data, account.name, rateLimitAccount.name, "429 rate limit");
                     const msg = `429 on ${account.name}, switched to ${rateLimitAccount.name}`;
                     console.warn(`[multi-account] ${msg}`);
                     _showToast("Rate Limit Switch", msg, "error", 8000);
@@ -1492,6 +1502,7 @@ export async function AnthropicAuthPlugin({ client, directory, worktree }) {
                   break;
                 }
 
+                logSwitch(data, account.name, retryAccount.name, "401/403 auth scope failure");
                 console.warn(`[multi-account] auth scope failed for ${account.name}, trying ${retryAccount.name}`);
                 account = retryAccount;
                 data.currentAccount = account.name;

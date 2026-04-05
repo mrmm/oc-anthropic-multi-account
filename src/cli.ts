@@ -1204,18 +1204,23 @@ function cmdConfig(args: string[]) {
   }
 }
 
+const SWITCH_LOG = join(
+  homedir(),
+  ".config/opencode/anthropic-multi-account-switches.log",
+);
+
 function logSwitch(data: any, from: string, to: string, reason: string) {
+  const ts = new Date().toISOString();
   if (!data.switchHistory) data.switchHistory = [];
-  data.switchHistory.push({
-    ts: new Date().toISOString(),
-    from,
-    to,
-    reason,
-  });
-  // Keep last 50 entries
+  data.switchHistory.push({ ts, from, to, reason });
   if (data.switchHistory.length > 50) {
     data.switchHistory = data.switchHistory.slice(-50);
   }
+  // Append to dedicated log file
+  try {
+    const line = `${ts}  ${from} → ${to}  [${reason}]\n`;
+    require("fs").appendFileSync(SWITCH_LOG, line);
+  } catch {}
 }
 
 function autoEvaluate(data: any) {
