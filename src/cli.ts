@@ -812,6 +812,7 @@ function cmdConfig(args: string[]) {
 
   const PLAN_PRICES: Record<string, number> = {
     pro: 20,
+    team: 30,
     max5x: 100,
     max20x: 200,
   };
@@ -830,38 +831,41 @@ function cmdConfig(args: string[]) {
     data.config = data.config || {};
     data.config.accounts = data.config.accounts || {};
 
-    // Handle --plan flag
+    // Handle --plan, --email, --org flags (can be combined in one call)
+    let accountChanged = false;
+
     const planArg = parseArg("--plan");
     if (planArg) {
-      const validPlans = ["pro", "max5x", "max20x"];
+      const validPlans = ["pro", "team", "max5x", "max20x"];
       if (!validPlans.includes(planArg)) {
         console.error(`\n  ❌ Invalid plan: '${planArg}'`);
         console.error(`     Valid plans: ${validPlans.join(", ")}\n`);
         return;
       }
       account.plan = { type: planArg, price: PLAN_PRICES[planArg] };
-      saveData(data);
       console.log(
-        `\n  ✅ Plan set for '${accountName}': ${planArg} ($${PLAN_PRICES[planArg]}/month)\n`,
+        `  ✅ Plan set for '${accountName}': ${planArg} ($${PLAN_PRICES[planArg]}/month)`,
       );
-      return;
+      accountChanged = true;
     }
 
-    // Handle --email flag
     const emailArg = parseArg("--email");
     if (emailArg) {
       account.email = emailArg;
-      saveData(data);
-      console.log(`\n  ✅ Email set for '${accountName}': ${emailArg}\n`);
-      return;
+      console.log(`  ✅ Email set for '${accountName}': ${emailArg}`);
+      accountChanged = true;
     }
 
-    // Handle --org flag
     const orgArg = parseArg("--org");
     if (orgArg) {
       account.org = orgArg;
+      console.log(`  ✅ Organization set for '${accountName}': ${orgArg}`);
+      accountChanged = true;
+    }
+
+    if (accountChanged) {
       saveData(data);
-      console.log(`\n  ✅ Organization set for '${accountName}': ${orgArg}\n`);
+      console.log();
       return;
     }
 
@@ -3875,6 +3879,11 @@ function cmdBarDetail() {
     console.log(`${i}.w7d_reset=${resetW}`);
     console.log(`${i}.sonnet=${pctSnt}`);
     console.log(`${i}.color=${color}`);
+    console.log(`${i}.email=${acct.email || ""}`);
+    console.log(`${i}.org=${acct.org || ""}`);
+    const planType =
+      typeof acct.plan === "object" ? acct.plan?.type : acct.plan || "";
+    console.log(`${i}.plan=${planType}`);
   }
 }
 
