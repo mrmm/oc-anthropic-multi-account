@@ -29,11 +29,14 @@ const TOOL_PREFIX = "mcp_";
 const CLAUDE_CLI_USER_AGENT = "claude-cli/2.1.2 (external, cli)";
 const AUTH_FILE = join(homedir(), ".local/share/opencode/auth.json");
 const CONFIG_DIR = join(homedir(), ".config/opencode");
-const MULTI_AUTH_FILE = join(CONFIG_DIR, "anthropic-multi-account-accounts.json");
-const LEGACY_MULTI_AUTH_FILE_CONFIG = join(CONFIG_DIR, "anthropic-multi-accounts.json");
-const LEGACY_MULTI_AUTH_FILE = join(homedir(), ".local/share/opencode/multi-account-auth.json");
-const STATE_FILE = join(CONFIG_DIR, "anthropic-multi-account-state.json");
-const LEGACY_STATE_FILE = join(homedir(), ".local/share/opencode/multi-account-state.json");
+const DATA_FILE = join(CONFIG_DIR, "anthropic-multi-account.json");
+
+// Legacy file paths (for migration)
+const LEGACY_ACCOUNTS_FILE = join(CONFIG_DIR, "anthropic-multi-account-accounts.json");
+const LEGACY_ACCOUNTS_FILE_CONFIG = join(CONFIG_DIR, "anthropic-multi-accounts.json");
+const LEGACY_ACCOUNTS_FILE_LOCAL = join(homedir(), ".local/share/opencode/multi-account-auth.json");
+const LEGACY_STATE_FILE = join(CONFIG_DIR, "anthropic-multi-account-state.json");
+const LEGACY_STATE_FILE_LOCAL = join(homedir(), ".local/share/opencode/multi-account-state.json");
 
 function readJsonWithFallback(filePaths, fallback) {
   for (const filePath of filePaths) {
@@ -184,61 +187,82 @@ function safeWriteJSON(filePath, data) {
   }
 }
 
-// Read multi-account-auth.json (separate file for multi-account tokens)
-function getMultiAuth() {
-  const sourcePaths = [
-    MULTI_AUTH_FILE,
-    LEGACY_MULTI_AUTH_FILE_CONFIG,
-    LEGACY_MULTI_AUTH_FILE,
+const EMPTY_DATA = {
+  version: "2.0",
+  accounts: [],
+  currentAccount: null,
+  requestCount: 0,
+  lastPrimaryCheck: null,
+  config: { threshold: 0.70, checkInterval: 3600000, accounts: {} },
+  usage: {}
+};
+
+/**
+ * Load consolidated data file, migrating from legacy two-file system if needed.
+ */
+function loadData() {
+  // 1. Try loading new consolidated file first
+  const newData = safeReadJSON(DATA_FILE, null);
+  if (newData && newData.version === "2.0") {
+    const normalized = normalizeMultiAuthShape(newData);
+    if (normalized.changed) {
+      const result = { ...newData, accounts: normalized.value.accounts };
+      saveData(result);
+      return result;
+    }
+    return newData;
+  }
+
+  // 2. Try migrating from legacy files
+  const legacyAccountSources = [
+    LEGACY_ACCOUNTS_FILE,
+    LEGACY_ACCOUNTS_FILE_CONFIG,
+    LEGACY_ACCOUNTS_FILE_LOCAL,
   ];
 
   const sources = [];
-
-  for (const sourcePath of sourcePaths) {
+  for (const sourcePath of legacyAccountSources) {
     const data = safeReadJSON(sourcePath, null);
     if (!data || typeof data !== "object") continue;
-
     const normalized = normalizeMultiAuthShape(data);
     if (!normalized.value || !Array.isArray(normalized.value.accounts)) continue;
-    sources.push({ sourcePath, data: normalized.value });
+    sources.push(normalized.value);
   }
 
-  if (sources.length === 0) return null;
+  const merged = sources.length > 0 ? mergeMultiAuthSources(sources) : null;
+  const accounts = merged?.accounts || [];
 
-  const merged = mergeMultiAuthSources(sources.map((source) => source.data));
-  if (!merged) return null;
-
-  const canonical = sources.find((source) => source.sourcePath === MULTI_AUTH_FILE)?.data ?? null;
-
-  if (!canonical || JSON.stringify(canonical) !== JSON.stringify(merged)) {
-    saveMultiAuth(merged);
-  }
-
-  return merged;
-}
-
-// Save multi-account-auth.json
-function saveMultiAuth(multiAuth) {
-  safeWriteJSON(MULTI_AUTH_FILE, multiAuth);
-}
-
-// Read state.json (usage, currentAccount, requestCount)
-function getState() {
-  const { data, sourcePath } = readJsonWithFallback(
-    [STATE_FILE, LEGACY_STATE_FILE],
+  const { data: legacyState, sourcePath: stateSource } = readJsonWithFallback(
+    [LEGACY_STATE_FILE, LEGACY_STATE_FILE_LOCAL],
     {}
   );
 
-  if (sourcePath === LEGACY_STATE_FILE && data && typeof data === "object") {
-    saveState(data);
+  // Merge into consolidated structure
+  const data = {
+    ...structuredClone(EMPTY_DATA),
+    accounts,
+    currentAccount: legacyState.currentAccount || null,
+    requestCount: Math.max(merged?.requestCount || 0, legacyState.requestCount || 0),
+    lastPrimaryCheck: legacyState.lastPrimaryCheck || null,
+    config: legacyState.config || EMPTY_DATA.config,
+    usage: legacyState.usage || {},
+  };
+
+  // Preserve authFailures if present
+  if (legacyState.authFailures) {
+    data.authFailures = legacyState.authFailures;
+  }
+
+  if (sources.length > 0 || stateSource) {
+    saveData(data);
+    console.log(`[multi-account] Migrated to consolidated file: ${DATA_FILE}`);
   }
 
   return data;
 }
 
-// Save state.json
-function saveState(state) {
-  safeWriteJSON(STATE_FILE, state);
+function saveData(data) {
+  safeWriteJSON(DATA_FILE, data);
 }
 
 function createOAuthTokenRequestInit(params) {
@@ -612,7 +636,7 @@ function selectThresholdAccount(accounts, state) {
 
 let refreshPromise = null;
 
-async function ensureFreshAccountToken(account, multiAuth) {
+async function ensureFreshAccountToken(account, data) {
   // API key accounts don't need token refresh
   if (account.type === "api_key" && account.apiKey) {
     return { ok: true };
@@ -663,12 +687,12 @@ async function ensureFreshAccountToken(account, multiAuth) {
           account.expires = Date.now() + json.expires_in * 1000;
 
           // Persist updated tokens
-          const idx = multiAuth.accounts.findIndex(
+          const idx = data.accounts.findIndex(
             (a) => a.name === account.name,
           );
           if (idx >= 0) {
-            multiAuth.accounts[idx] = account;
-            saveMultiAuth(multiAuth);
+            data.accounts[idx] = account;
+            saveData(data);
           }
 
           return { ok: true };
@@ -884,9 +908,9 @@ export async function AnthropicAuthPlugin({ client }) {
         // Bug fix: handle undefined auth
         if (!auth) return {};
 
-        // Check for multi-account mode by reading separate multi-account-auth.json
-        const multiAuth = getMultiAuth();
-        const hasMultiAccounts = multiAuth?.accounts?.length > 0;
+        // Check for multi-account mode by reading consolidated data file
+        const pluginData = loadData();
+        const hasMultiAccounts = pluginData?.accounts?.length > 0;
 
         // Handle multi-account auth
         if (auth.type === "oauth" && hasMultiAccounts) {
@@ -909,35 +933,34 @@ export async function AnthropicAuthPlugin({ client }) {
              * @param {any} init
              */
             async fetch(input, init) {
-              // Read accounts from multi-account-auth.json, state from state.json
-              const multiAuth = getMultiAuth();
-              if (!multiAuth?.accounts?.length) {
+              // Read consolidated data file
+              const data = loadData();
+              if (!data?.accounts?.length) {
                 return fetch(input, init);
               }
 
-              const accounts = multiAuth.accounts;
-              const state = getState();
+              const accounts = data.accounts;
 
-               ensureAllAccountsInState(accounts, state);
-               resolveStaleMetrics(state);
+               ensureAllAccountsInState(accounts, data);
+               resolveStaleMetrics(data);
 
-               let account = selectThresholdAccount(accounts, state);
+               let account = selectThresholdAccount(accounts, data);
                if (!account) {
                  throw new Error("No accounts configured for multi-account");
                }
 
                // Track state for threshold logic
-               const previousAccount = state.currentAccount;
+               const previousAccount = data.currentAccount;
                const primaryName = accounts[0]?.name;
-               state.currentAccount = account.name;
+               data.currentAccount = account.name;
                if (account.name !== previousAccount && account.name !== primaryName) {
-                 state.lastPrimaryCheck = Date.now();
+                 data.lastPrimaryCheck = Date.now();
                }
 
                // Refresh account token, fallback to other account on token failure.
                const attemptedAccounts = new Set();
                while (true) {
-                 const refreshResult = await ensureFreshAccountToken(account, multiAuth);
+                 const refreshResult = await ensureFreshAccountToken(account, data);
                  if (refreshResult.ok) break;
 
                  attemptedAccounts.add(account.name);
@@ -948,14 +971,14 @@ export async function AnthropicAuthPlugin({ client }) {
 
                  console.warn(`[multi-account] refresh failed for ${account.name} (${refreshResult.status}), trying ${fallback.name}`);
                  account = fallback;
-                 state.currentAccount = account.name;
+                 data.currentAccount = account.name;
                  if (account.name !== previousAccount && account.name !== primaryName) {
-                   state.lastPrimaryCheck = Date.now();
+                   data.lastPrimaryCheck = Date.now();
                  }
                }
 
               // Increment request counter
-              state.requestCount = (state.requestCount || 0) + 1;
+              data.requestCount = (data.requestCount || 0) + 1;
 
               const requestInit = init ?? {};
               const requestHeaders = mergeHeaders(input, init);
@@ -1024,13 +1047,13 @@ export async function AnthropicAuthPlugin({ client }) {
                   break;
                 }
 
-                state.authFailures = state.authFailures || {};
-                state.authFailures[account.name] = Date.now() + AUTH_FAILURE_COOLDOWN;
+                data.authFailures = data.authFailures || {};
+                data.authFailures[account.name] = Date.now() + AUTH_FAILURE_COOLDOWN;
 
                 const retryAccount = accounts.find(
                   (candidate) =>
                     !attemptedRequestAccounts.has(candidate.name) &&
-                    (!state.authFailures?.[candidate.name] || state.authFailures[candidate.name] <= Date.now()),
+                    (!data.authFailures?.[candidate.name] || data.authFailures[candidate.name] <= Date.now()),
                 );
 
                 if (!retryAccount) {
@@ -1039,27 +1062,27 @@ export async function AnthropicAuthPlugin({ client }) {
 
                 console.warn(`[multi-account] auth scope failed for ${account.name}, trying ${retryAccount.name}`);
                 account = retryAccount;
-                state.currentAccount = account.name;
+                data.currentAccount = account.name;
                 if (account.name !== previousAccount && account.name !== primaryName) {
-                  state.lastPrimaryCheck = Date.now();
+                  data.lastPrimaryCheck = Date.now();
                 }
 
-                const retryRefresh = await ensureFreshAccountToken(account, multiAuth);
+                const retryRefresh = await ensureFreshAccountToken(account, data);
                 if (!retryRefresh.ok) {
-                  state.authFailures[account.name] = Date.now() + AUTH_FAILURE_COOLDOWN;
+                  data.authFailures[account.name] = Date.now() + AUTH_FAILURE_COOLDOWN;
                   continue;
                 }
               }
 
-              if (state.authFailures?.[account.name]) {
-                delete state.authFailures[account.name];
+              if (data.authFailures?.[account.name]) {
+                delete data.authFailures[account.name];
               }
 
-              // Capture usage from response headers and save to state
+              // Capture usage from response headers and save to data
               // Only update metrics when headers are actually present to avoid
               // overwriting valid data with zeros (e.g. Sonnet headers only appear on Sonnet requests)
-              state.usage = state.usage || {};
-              const prev = state.usage[account.name] || {};
+              data.usage = data.usage || {};
+              const prev = data.usage[account.name] || {};
 
               function updateMetric(prev, prefix) {
                 const rawUtil = response.headers.get(`${prefix}-utilization`);
@@ -1079,15 +1102,15 @@ export async function AnthropicAuthPlugin({ client }) {
                 };
               }
 
-              state.usage[account.name] = {
+              data.usage[account.name] = {
                 session5h: updateMetric(prev.session5h, 'anthropic-ratelimit-unified-5h'),
                 weekly7d: updateMetric(prev.weekly7d, 'anthropic-ratelimit-unified-7d'),
                 weekly7dSonnet: updateMetric(prev.weekly7dSonnet, 'anthropic-ratelimit-unified-7d_sonnet'),
                 timestamp: new Date().toISOString()
               };
 
-              // Save state (usage, currentAccount, requestCount)
-              saveState(state);
+              // Save consolidated data
+              saveData(data);
 
               // Transform streaming response to strip tool prefixes
               return createStrippedStream(response);

@@ -38,25 +38,45 @@ const REQUIRED_BETAS = ["oauth-2025-04-20", "interleaved-thinking-2025-05-14"];
 const TOOL_PREFIX = "mcp_";
 const CLAUDE_CLI_USER_AGENT = "claude-cli/2.1.2 (external, cli)";
 const CONFIG_DIR = join(homedir(), ".config/opencode");
-const MULTI_AUTH_FILE = join(
+const DATA_FILE = join(CONFIG_DIR, "anthropic-multi-account.json");
+
+// Legacy file paths (for migration)
+const LEGACY_ACCOUNTS_FILE = join(
   CONFIG_DIR,
   "anthropic-multi-account-accounts.json",
 );
-const LEGACY_MULTI_AUTH_FILE_CONFIG = join(
+const LEGACY_ACCOUNTS_FILE_CONFIG = join(
   CONFIG_DIR,
   "anthropic-multi-accounts.json",
 );
-const LEGACY_MULTI_AUTH_FILE = join(
+const LEGACY_ACCOUNTS_FILE_LOCAL = join(
   homedir(),
   ".local/share/opencode/multi-account-auth.json",
 );
-const STATE_FILE = join(CONFIG_DIR, "anthropic-multi-account-state.json");
 const LEGACY_STATE_FILE = join(
+  CONFIG_DIR,
+  "anthropic-multi-account-state.json",
+);
+const LEGACY_STATE_FILE_LOCAL = join(
   homedir(),
   ".local/share/opencode/multi-account-state.json",
 );
 
 const DEFAULTS = { threshold: 0.7, checkInterval: 3600000 };
+
+const EMPTY_DATA = {
+  version: "2.0",
+  accounts: [] as any[],
+  currentAccount: null as string | null,
+  requestCount: 0,
+  lastPrimaryCheck: null as number | null,
+  config: {
+    threshold: 0.7,
+    checkInterval: 3600000,
+    accounts: {} as Record<string, any>,
+  },
+  usage: {} as Record<string, any>,
+};
 
 function createOAuthTokenRequestInit(
   params: Record<string, string | undefined>,
@@ -240,44 +260,71 @@ function normalizeMultiAuthShape(multiAuth: any): {
   return { value: { ...multiAuth, accounts }, changed: true };
 }
 
-function loadAccounts() {
-  return loadMultiAuth().accounts || [];
-}
+/**
+ * Load consolidated data file, migrating from legacy two-file system if needed.
+ */
+function loadData(): typeof EMPTY_DATA & Record<string, any> {
+  // 1. Try loading new consolidated file first
+  const newData = safeReadJSON<any>(DATA_FILE, null);
+  if (newData && newData.version === "2.0") {
+    // Normalize account fields
+    const normalized = normalizeMultiAuthShape(newData);
+    if (normalized.changed) {
+      const result = { ...newData, accounts: normalized.value.accounts };
+      saveData(result);
+      return result;
+    }
+    return newData;
+  }
 
-function loadMultiAuth(): any {
-  const { data, source } = readWithFallback(
-    [MULTI_AUTH_FILE, LEGACY_MULTI_AUTH_FILE_CONFIG, LEGACY_MULTI_AUTH_FILE],
+  // 2. Try migrating from legacy files
+  const { data: legacyAccounts, source: accountsSource } = readWithFallback(
+    [
+      LEGACY_ACCOUNTS_FILE,
+      LEGACY_ACCOUNTS_FILE_CONFIG,
+      LEGACY_ACCOUNTS_FILE_LOCAL,
+    ],
     { accounts: [] },
   );
-  const normalized = normalizeMultiAuthShape(data);
-  if (
-    (source === LEGACY_MULTI_AUTH_FILE_CONFIG ||
-      source === LEGACY_MULTI_AUTH_FILE ||
-      normalized.changed) &&
-    normalized.value
-  ) {
-    saveMultiAuth(normalized.value);
-  }
-  return normalized.value;
-}
-
-function saveMultiAuth(data: any) {
-  safeWriteJSON(MULTI_AUTH_FILE, data);
-}
-
-function loadState(): any {
-  const { data, source } = readWithFallback(
-    [STATE_FILE, LEGACY_STATE_FILE],
+  const { data: legacyState, source: stateSource } = readWithFallback(
+    [LEGACY_STATE_FILE, LEGACY_STATE_FILE_LOCAL],
     {},
   );
-  if (source === LEGACY_STATE_FILE) {
-    saveState(data);
+
+  const normalized = normalizeMultiAuthShape(legacyAccounts);
+  const accounts = normalized.value?.accounts || legacyAccounts?.accounts || [];
+
+  // Merge into consolidated structure
+  const data: any = {
+    ...structuredClone(EMPTY_DATA),
+    accounts,
+    currentAccount: legacyState.currentAccount || null,
+    requestCount: legacyState.requestCount || 0,
+    lastPrimaryCheck: legacyState.lastPrimaryCheck || null,
+    config: legacyState.config || EMPTY_DATA.config,
+    usage: legacyState.usage || {},
+  };
+
+  // Preserve authFailures if present
+  if (legacyState.authFailures) {
+    data.authFailures = legacyState.authFailures;
   }
+
+  if (accountsSource || stateSource) {
+    // Save migrated data
+    saveData(data);
+    console.log(`  ⚡ Migrated to consolidated file: ${DATA_FILE}`);
+  }
+
   return data;
 }
 
-function saveState(state: any) {
-  safeWriteJSON(STATE_FILE, state);
+function saveData(data: any) {
+  safeWriteJSON(DATA_FILE, data);
+}
+
+function loadAccounts() {
+  return loadData().accounts || [];
 }
 
 // ============================================================================
@@ -383,20 +430,20 @@ function relativeLastUsed(timestamp: string | null): string {
 }
 
 function renderUsage(watch: boolean) {
-  const accounts = loadAccounts();
-  const state = loadState();
-  const config = state.config || {};
+  const data = loadData();
+  const accounts = data.accounts || [];
+  const config = data.config || {};
 
-  const accountsChanged = ensureAllAccountsInState(accounts, state);
-  const staleResolved = resolveStaleMetrics(state);
+  const accountsChanged = ensureAllAccountsInState(accounts, data);
+  const staleResolved = resolveStaleMetrics(data);
   if (accountsChanged || staleResolved) {
-    autoEvaluate(state);
-    saveState(state);
+    autoEvaluate(data);
+    saveData(data);
   }
 
   if (watch) process.stdout.write("\x1b[2J\x1b[H");
 
-  const totalRequests = state.requestCount || 0;
+  const totalRequests = data.requestCount || 0;
   const CARD_W = 72;
 
   // Compact header
@@ -414,10 +461,10 @@ function renderUsage(watch: boolean) {
 
   // Compact table mode for watch with 3+ accounts
   if (watch && accounts.length >= 3) {
-    renderCompactUsage(accounts, state, config, totalRequests);
+    renderCompactUsage(accounts, data, config, totalRequests);
 
     // Summary line
-    const activeAcct = state.currentAccount || accounts[0]?.name || "none";
+    const activeAcct = data.currentAccount || accounts[0]?.name || "none";
     const threshStr = allSame(globalT)
       ? `${Math.round(globalT.session5h * 100)}%`
       : `${Math.round(globalT.session5h * 100)}/${Math.round(globalT.weekly7d * 100)}/${Math.round(globalT.weekly7dSonnet * 100)}%`;
@@ -439,8 +486,8 @@ function renderUsage(watch: boolean) {
   const LABEL_W = 16;
 
   for (const account of accounts) {
-    const isActive = state.currentAccount === account.name;
-    const usage = state.usage?.[account.name];
+    const isActive = data.currentAccount === account.name;
+    const usage = data.usage?.[account.name];
     const acctT = getAccountThresholds(account.name, config);
     const thresholdMap: Record<string, number> = {
       session5h: acctT.session5h,
@@ -530,13 +577,13 @@ function renderUsage(watch: boolean) {
   }
 
   // Summary line
-  const activeAcct = state.currentAccount || accounts[0]?.name || "none";
-  const threshStr = allSame(globalT)
+  const activeAcct2 = data.currentAccount || accounts[0]?.name || "none";
+  const threshStr2 = allSame(globalT)
     ? `${Math.round(globalT.session5h * 100)}%`
     : `${Math.round(globalT.session5h * 100)}/${Math.round(globalT.weekly7d * 100)}/${Math.round(globalT.weekly7dSonnet * 100)}%`;
-  const intervalMin = (config.checkInterval ?? DEFAULTS.checkInterval) / 60000;
+  const intervalMin2 = (config.checkInterval ?? DEFAULTS.checkInterval) / 60000;
   console.log(
-    `\n  Active: ${activeAcct} \u00b7 Thresholds: ${threshStr} \u00b7 Check interval: ${intervalMin}m`,
+    `\n  Active: ${activeAcct2} \u00b7 Thresholds: ${threshStr2} \u00b7 Check interval: ${intervalMin2}m`,
   );
 
   if (watch) {
@@ -622,8 +669,8 @@ function renderCompactUsage(
   );
 
   for (const account of accounts) {
-    const isActive = state.currentAccount === account.name;
-    const usage = state.usage?.[account.name];
+    const isActive = state?.currentAccount === account.name;
+    const usage = state?.usage?.[account.name];
     const activeTag = isActive ? " \u25c4" : "";
     const authOk = account.type === "api_key" || account.expires > Date.now();
     const statusIcon = authOk ? "\u2705" : "\u26a0\ufe0f";
@@ -665,7 +712,7 @@ function cmdUsage(args: string[]) {
 // ============================================================================
 
 function cmdConfig(args: string[]) {
-  const state = loadState();
+  const data = loadData();
 
   const parseArg = (flag: string) => {
     const idx = args.indexOf(flag);
@@ -676,7 +723,7 @@ function cmdConfig(args: string[]) {
 
   // Per-account config mode
   if (accountName) {
-    const accounts = loadAccounts();
+    const accounts = data.accounts || [];
     if (!accounts.find((a: any) => a.name === accountName)) {
       const available = accounts.map((a: any) => a.name).join(", ");
       console.error(`\n  ❌ Account '${accountName}' not found`);
@@ -684,8 +731,8 @@ function cmdConfig(args: string[]) {
       return;
     }
 
-    state.config = state.config || {};
-    state.config.accounts = state.config.accounts || {};
+    data.config = data.config || {};
+    data.config.accounts = data.config.accounts || {};
 
     // Show per-account config
     const hasThresholdArg =
@@ -696,12 +743,12 @@ function cmdConfig(args: string[]) {
       args.includes("--threshold-sonnet");
 
     if (!hasThresholdArg && !args.includes("--reset")) {
-      const t = getAccountThresholds(accountName, state.config);
+      const t = getAccountThresholds(accountName, data.config);
       const globalT = normalizeThresholds(
-        state.config.threshold,
+        data.config.threshold,
         DEFAULTS.threshold,
       );
-      const hasOverride = !!state.config.accounts[accountName]?.threshold;
+      const hasOverride = !!data.config.accounts[accountName]?.threshold;
 
       console.log(`\n  ⚙️  Configuration for account: ${accountName}`);
       console.log("  ────────────────────────────────────────\n");
@@ -729,11 +776,11 @@ function cmdConfig(args: string[]) {
 
     // Reset per-account config
     if (args.includes("--reset")) {
-      delete state.config.accounts[accountName];
-      if (Object.keys(state.config.accounts).length === 0) {
-        delete state.config.accounts;
+      delete data.config.accounts[accountName];
+      if (Object.keys(data.config.accounts).length === 0) {
+        delete data.config.accounts;
       }
-      saveState(state);
+      saveData(data);
       console.log(
         `\n  ✅ Per-account config for '${accountName}' removed (using global defaults)\n`,
       );
@@ -741,8 +788,7 @@ function cmdConfig(args: string[]) {
     }
 
     // Set per-account thresholds
-    state.config.accounts[accountName] =
-      state.config.accounts[accountName] || {};
+    data.config.accounts[accountName] = data.config.accounts[accountName] || {};
     let changed = false;
 
     const t = parseArg("--threshold");
@@ -754,7 +800,7 @@ function cmdConfig(args: string[]) {
         );
         return;
       }
-      state.config.accounts[accountName].threshold = val;
+      data.config.accounts[accountName].threshold = val;
       changed = true;
     }
 
@@ -767,7 +813,7 @@ function cmdConfig(args: string[]) {
         );
         return;
       }
-      state.config.accounts[accountName].threshold = {
+      data.config.accounts[accountName].threshold = {
         session5h: parts[0] / 100,
         weekly7d: parts[1] / 100,
         weekly7dSonnet: parts[2] / 100,
@@ -777,41 +823,41 @@ function cmdConfig(args: string[]) {
 
     const ts = parseArg("--threshold-session");
     if (ts) {
-      const current = state.config.accounts[accountName].threshold;
-      const resolved = getAccountThresholds(accountName, state.config);
+      const current = data.config.accounts[accountName].threshold;
+      const resolved = getAccountThresholds(accountName, data.config);
       if (typeof current !== "object" || current === null) {
-        state.config.accounts[accountName].threshold = { ...resolved };
+        data.config.accounts[accountName].threshold = { ...resolved };
       }
-      state.config.accounts[accountName].threshold.session5h = parseFloat(ts);
+      data.config.accounts[accountName].threshold.session5h = parseFloat(ts);
       changed = true;
     }
 
     const tw = parseArg("--threshold-weekly");
     if (tw) {
-      const current = state.config.accounts[accountName].threshold;
-      const resolved = getAccountThresholds(accountName, state.config);
+      const current = data.config.accounts[accountName].threshold;
+      const resolved = getAccountThresholds(accountName, data.config);
       if (typeof current !== "object" || current === null) {
-        state.config.accounts[accountName].threshold = { ...resolved };
+        data.config.accounts[accountName].threshold = { ...resolved };
       }
-      state.config.accounts[accountName].threshold.weekly7d = parseFloat(tw);
+      data.config.accounts[accountName].threshold.weekly7d = parseFloat(tw);
       changed = true;
     }
 
     const tso = parseArg("--threshold-sonnet");
     if (tso) {
-      const current = state.config.accounts[accountName].threshold;
-      const resolved = getAccountThresholds(accountName, state.config);
+      const current = data.config.accounts[accountName].threshold;
+      const resolved = getAccountThresholds(accountName, data.config);
       if (typeof current !== "object" || current === null) {
-        state.config.accounts[accountName].threshold = { ...resolved };
+        data.config.accounts[accountName].threshold = { ...resolved };
       }
-      state.config.accounts[accountName].threshold.weekly7dSonnet =
+      data.config.accounts[accountName].threshold.weekly7dSonnet =
         parseFloat(tso);
       changed = true;
     }
 
     if (changed) {
-      autoEvaluate(state);
-      saveState(state);
+      autoEvaluate(data);
+      saveData(data);
       console.log(`\n  ✅ Per-account config for '${accountName}' saved`);
       cmdConfig(["--account", accountName]);
     }
@@ -820,7 +866,7 @@ function cmdConfig(args: string[]) {
 
   // Global config mode (original behavior)
   if (args.includes("--show") || args.length === 0) {
-    const cfg = state.config || {};
+    const cfg = data.config || {};
     const t = normalizeThresholds(cfg.threshold, DEFAULTS.threshold);
 
     console.log("\n  ⚙️  Current Configuration");
@@ -867,8 +913,8 @@ function cmdConfig(args: string[]) {
   }
 
   if (args.includes("--reset")) {
-    delete state.config;
-    saveState(state);
+    data.config = structuredClone(EMPTY_DATA.config);
+    saveData(data);
     console.log("\n  ✅ Configuration reset to defaults");
     console.log(
       `     Threshold: ${Math.round(DEFAULTS.threshold * 100)}%  |  Check interval: ${DEFAULTS.checkInterval / 60000} min\n`,
@@ -876,19 +922,19 @@ function cmdConfig(args: string[]) {
     return;
   }
 
-  state.config = state.config || {};
+  data.config = data.config || {};
   let changed = false;
 
   function ensureThresholdObject() {
-    const current = state.config.threshold;
+    const current = data.config.threshold;
     if (typeof current === "number") {
-      state.config.threshold = {
+      data.config.threshold = {
         session5h: current,
         weekly7d: current,
         weekly7dSonnet: current,
       };
     } else if (!current || typeof current !== "object") {
-      state.config.threshold = {
+      data.config.threshold = {
         session5h: DEFAULTS.threshold,
         weekly7d: DEFAULTS.threshold,
         weekly7dSonnet: DEFAULTS.threshold,
@@ -916,7 +962,7 @@ function cmdConfig(args: string[]) {
         "\n  ⚠️  Threshold above 95% increases risk of hitting rate limits",
       );
     }
-    state.config.threshold = val;
+    data.config.threshold = val;
     changed = true;
   }
 
@@ -931,7 +977,7 @@ function cmdConfig(args: string[]) {
       console.error("     Run: bun src/cli.ts config --thresholds 95,80,90\n");
       return;
     }
-    state.config.threshold = {
+    data.config.threshold = {
       session5h: parts[0] / 100,
       weekly7d: parts[1] / 100,
       weekly7dSonnet: parts[2] / 100,
@@ -942,46 +988,46 @@ function cmdConfig(args: string[]) {
   const ts = parseArg("--threshold-session");
   if (ts) {
     ensureThresholdObject();
-    state.config.threshold.session5h = parseFloat(ts);
+    data.config.threshold.session5h = parseFloat(ts);
     changed = true;
   }
 
   const tw = parseArg("--threshold-weekly");
   if (tw) {
     ensureThresholdObject();
-    state.config.threshold.weekly7d = parseFloat(tw);
+    data.config.threshold.weekly7d = parseFloat(tw);
     changed = true;
   }
 
   const tso = parseArg("--threshold-sonnet");
   if (tso) {
     ensureThresholdObject();
-    state.config.threshold.weekly7dSonnet = parseFloat(tso);
+    data.config.threshold.weekly7dSonnet = parseFloat(tso);
     changed = true;
   }
 
   const i = parseArg("--interval");
   if (i) {
-    state.config.checkInterval = parseInt(i) * 60000;
+    data.config.checkInterval = parseInt(i) * 60000;
     changed = true;
   }
 
   // Clean up legacy recover config
-  delete state.config.recover;
+  delete data.config.recover;
 
   if (changed) {
-    autoEvaluate(state);
-    saveState(state);
+    autoEvaluate(data);
+    saveData(data);
     console.log("\n  ✅ Configuration saved");
     cmdConfig(["--show"]);
   }
 }
 
-function autoEvaluate(state: any) {
-  const accounts = loadAccounts();
-  if (accounts.length < 2 || !state.currentAccount) return;
+function autoEvaluate(data: any) {
+  const accounts = data.accounts || [];
+  if (accounts.length < 2 || !data.currentAccount) return;
 
-  const config = state.config || {};
+  const config = data.config || {};
 
   function isOverThreshold(accountName: string, usage: any): boolean {
     if (!usage) return false;
@@ -994,14 +1040,14 @@ function autoEvaluate(state: any) {
   }
 
   const primary = accounts[0];
-  const currentAccount = state.currentAccount;
-  const primaryUsage = state.usage?.[primary.name];
+  const currentAccount = data.currentAccount;
+  const primaryUsage = data.usage?.[primary.name];
 
   if (currentAccount === primary.name) {
     if (isOverThreshold(primary.name, primaryUsage)) {
       for (const fallback of accounts.slice(1)) {
-        if (!isOverThreshold(fallback.name, state.usage?.[fallback.name])) {
-          state.currentAccount = fallback.name;
+        if (!isOverThreshold(fallback.name, data.usage?.[fallback.name])) {
+          data.currentAccount = fallback.name;
           console.log(
             `  ⚡ Auto-switch: ${primary.name} → ${fallback.name} (threshold exceeded)`,
           );
@@ -1011,7 +1057,7 @@ function autoEvaluate(state: any) {
     }
   } else {
     if (!isOverThreshold(primary.name, primaryUsage)) {
-      state.currentAccount = primary.name;
+      data.currentAccount = primary.name;
       console.log(
         `  ⚡ Auto-switch: ${currentAccount} → ${primary.name} (primary under threshold)`,
       );
@@ -1162,27 +1208,29 @@ async function cmdAdd(args: string[]) {
       refresh_token: string;
       expires_in: number;
     };
-    const multiAuth = loadMultiAuth();
-    multiAuth.accounts ??= [];
+    const data = loadData();
+    data.accounts ??= [];
 
     const account = {
+      id: crypto.randomUUID(),
       name,
       access: json.access_token,
       refresh: json.refresh_token,
       expires: Date.now() + json.expires_in * 1000,
       type: "oauth",
     };
-    const idx = multiAuth.accounts.findIndex((a: any) => a.name === name);
+    const idx = data.accounts.findIndex((a: any) => a.name === name);
 
     if (idx >= 0) {
-      multiAuth.accounts[idx] = account;
+      account.id = data.accounts[idx].id || account.id;
+      data.accounts[idx] = account;
       console.log(`\n  \u2705 Account '${name}' updated`);
     } else {
-      multiAuth.accounts.push(account);
+      data.accounts.push(account);
       console.log(`\n  \u2705 Account '${name}' added`);
     }
 
-    saveMultiAuth(multiAuth);
+    saveData(data);
     console.log("     Restart OpenCode to use the new account");
     console.log(`     Run: bun src/cli.ts usage    View usage metrics\n`);
     return;
@@ -1204,25 +1252,27 @@ async function cmdAdd(args: string[]) {
       return;
     }
 
-    const multiAuth = loadMultiAuth();
-    multiAuth.accounts ??= [];
+    const data = loadData();
+    data.accounts ??= [];
 
     const account = {
+      id: crypto.randomUUID(),
       name,
       apiKey,
       type: "api_key",
     };
-    const idx = multiAuth.accounts.findIndex((a: any) => a.name === name);
+    const idx = data.accounts.findIndex((a: any) => a.name === name);
 
     if (idx >= 0) {
-      multiAuth.accounts[idx] = account;
+      account.id = data.accounts[idx].id || account.id;
+      data.accounts[idx] = account;
       console.log(`\n  \u2705 Account '${name}' updated with API key`);
     } else {
-      multiAuth.accounts.push(account);
+      data.accounts.push(account);
       console.log(`\n  \u2705 Account '${name}' added with API key`);
     }
 
-    saveMultiAuth(multiAuth);
+    saveData(data);
     console.log("     Restart OpenCode to use the new account");
     console.log(`     Run: bun src/cli.ts usage    View usage metrics\n`);
     return;
@@ -1290,27 +1340,29 @@ async function cmdAdd(args: string[]) {
     refresh_token: string;
     expires_in: number;
   };
-  const multiAuth = loadMultiAuth();
-  multiAuth.accounts ??= [];
+  const data = loadData();
+  data.accounts ??= [];
 
   const account = {
+    id: crypto.randomUUID(),
     name,
     access: json.access_token,
     refresh: json.refresh_token,
     expires: Date.now() + json.expires_in * 1000,
     type: "oauth",
   };
-  const idx = multiAuth.accounts.findIndex((a: any) => a.name === name);
+  const idx = data.accounts.findIndex((a: any) => a.name === name);
 
   if (idx >= 0) {
-    multiAuth.accounts[idx] = account;
+    account.id = data.accounts[idx].id || account.id;
+    data.accounts[idx] = account;
     console.log(`\n  \u2705 Account '${name}' updated`);
   } else {
-    multiAuth.accounts.push(account);
+    data.accounts.push(account);
     console.log(`\n  \u2705 Account '${name}' added`);
   }
 
-  saveMultiAuth(multiAuth);
+  saveData(data);
   console.log("     Restart OpenCode to use the new account");
   console.log(`     Run: bun src/cli.ts usage    View usage metrics\n`);
 }
@@ -1345,12 +1397,12 @@ async function refreshToken(account: any): Promise<string | null> {
     account.refresh = json.refresh_token;
     account.expires = Date.now() + json.expires_in * 1000;
     // Persist refreshed tokens
-    const multiAuth = loadMultiAuth();
+    const data = loadData();
     const idx =
-      multiAuth.accounts?.findIndex((a: any) => a.name === account.name) ?? -1;
+      data.accounts?.findIndex((a: any) => a.name === account.name) ?? -1;
     if (idx >= 0) {
-      multiAuth.accounts[idx] = account;
-      saveMultiAuth(multiAuth);
+      data.accounts[idx] = account;
+      saveData(data);
     }
     return null;
   } catch (err) {
@@ -1396,9 +1448,9 @@ function parseRateLimitHeaders(res: Response): QuotaSnapshot | null {
 }
 
 function updateUsageState(alias: string, quota: QuotaSnapshot): void {
-  const state = loadState();
-  state.usage = state.usage || {};
-  const prev = state.usage[alias] || {};
+  const data = loadData();
+  data.usage = data.usage || {};
+  const prev = data.usage[alias] || {};
 
   function mergeMetric(prevMetric: any, newMetric: QuotaMetric | null) {
     if (!newMetric)
@@ -1410,13 +1462,13 @@ function updateUsageState(alias: string, quota: QuotaSnapshot): void {
     };
   }
 
-  state.usage[alias] = {
+  data.usage[alias] = {
     session5h: mergeMetric(prev.session5h, quota.session5h),
     weekly7d: mergeMetric(prev.weekly7d, quota.weekly7d),
     weekly7dSonnet: mergeMetric(prev.weekly7dSonnet, quota.weekly7dSonnet),
     timestamp: new Date().toISOString(),
   };
-  saveState(state);
+  saveData(data);
 }
 
 function miniProgressBar(utilization: number, width: number = 15): string {
@@ -1681,8 +1733,8 @@ async function cmdReauth(alias: string, args: string[]) {
         refresh_token: string;
         expires_in: number;
       };
-      const multiAuth = loadMultiAuth();
-      multiAuth.accounts ??= [];
+      const reauthData = loadData();
+      reauthData.accounts ??= [];
       const updated = {
         name: alias,
         access: json.access_token,
@@ -1690,13 +1742,16 @@ async function cmdReauth(alias: string, args: string[]) {
         expires: Date.now() + json.expires_in * 1000,
         type: "oauth",
       };
-      const idx = multiAuth.accounts.findIndex((a: any) => a.name === alias);
+      const idx = reauthData.accounts.findIndex((a: any) => a.name === alias);
       if (idx >= 0) {
-        multiAuth.accounts[idx] = updated;
+        (updated as any).id =
+          reauthData.accounts[idx].id || crypto.randomUUID();
+        reauthData.accounts[idx] = updated;
       } else {
-        multiAuth.accounts.push(updated);
+        (updated as any).id = crypto.randomUUID();
+        reauthData.accounts.push(updated);
       }
-      saveMultiAuth(multiAuth);
+      saveData(reauthData);
       console.log(JSON.stringify({ status: "ok", alias }));
       return;
     }
@@ -1753,25 +1808,25 @@ async function cmdReauth(alias: string, args: string[]) {
         return;
       }
 
-      const multiAuth = loadMultiAuth();
-      multiAuth.accounts ??= [];
+      const reauthApiData = loadData();
+      reauthApiData.accounts ??= [];
       const updated: any = {
+        id: crypto.randomUUID(),
         name: alias,
         apiKey,
         type: "api_key",
       };
-      // Clear OAuth fields
-      delete updated.access;
-      delete updated.refresh;
-      delete updated.expires;
 
-      const idx = multiAuth.accounts.findIndex((a: any) => a.name === alias);
+      const idx = reauthApiData.accounts.findIndex(
+        (a: any) => a.name === alias,
+      );
       if (idx >= 0) {
-        multiAuth.accounts[idx] = updated;
+        updated.id = reauthApiData.accounts[idx].id || updated.id;
+        reauthApiData.accounts[idx] = updated;
       } else {
-        multiAuth.accounts.push(updated);
+        reauthApiData.accounts.push(updated);
       }
-      saveMultiAuth(multiAuth);
+      saveData(reauthApiData);
       console.log(`\n  \u2705 API key saved for '${alias}'\n`);
       return;
     }
@@ -1841,8 +1896,8 @@ async function cmdReauth(alias: string, args: string[]) {
       refresh_token: string;
       expires_in: number;
     };
-    const multiAuth = loadMultiAuth();
-    multiAuth.accounts ??= [];
+    const reauthOauthData = loadData();
+    reauthOauthData.accounts ??= [];
     const updated = {
       name: alias,
       access: json.access_token,
@@ -1850,13 +1905,18 @@ async function cmdReauth(alias: string, args: string[]) {
       expires: Date.now() + json.expires_in * 1000,
       type: "oauth",
     };
-    const idx = multiAuth.accounts.findIndex((a: any) => a.name === alias);
+    const idx = reauthOauthData.accounts.findIndex(
+      (a: any) => a.name === alias,
+    );
     if (idx >= 0) {
-      multiAuth.accounts[idx] = updated;
+      (updated as any).id =
+        reauthOauthData.accounts[idx].id || crypto.randomUUID();
+      reauthOauthData.accounts[idx] = updated;
     } else {
-      multiAuth.accounts.push(updated);
+      (updated as any).id = crypto.randomUUID();
+      reauthOauthData.accounts.push(updated);
     }
-    saveMultiAuth(multiAuth);
+    saveData(reauthOauthData);
 
     const expiresMin = Math.round(json.expires_in / 60);
     console.log(`  \u2705 Account '${alias}' re-authenticated`);
@@ -1884,8 +1944,8 @@ function cmdSetPrimary(name: string) {
     return;
   }
 
-  const multiAuth = loadMultiAuth();
-  if (!multiAuth?.accounts?.length) {
+  const data = loadData();
+  if (!data.accounts?.length) {
     console.log("\n  ❌ No accounts configured");
     console.log(
       "     Run: bun src/cli.ts add <name>    Add an account first\n",
@@ -1893,9 +1953,9 @@ function cmdSetPrimary(name: string) {
     return;
   }
 
-  const account = multiAuth.accounts.find((a: any) => a.name === name);
+  const account = data.accounts.find((a: any) => a.name === name);
   if (!account) {
-    const available = multiAuth.accounts.map((a: any) => a.name).join(", ");
+    const available = data.accounts.map((a: any) => a.name).join(", ");
     console.log(`\n  ❌ Account '${name}' not found`);
     console.log(`     Available accounts: ${available}`);
     console.log("     Run: bun src/cli.ts list\n");
@@ -1907,30 +1967,30 @@ function cmdSetPrimary(name: string) {
 
   // Current order
   console.log("  Before:");
-  multiAuth.accounts.forEach((a: any, i: number) => {
+  data.accounts.forEach((a: any, i: number) => {
     const role = i === 0 ? " (primary)" : " (fallback)";
     const marker = a.name === name ? " ◄" : "";
     console.log(`    ${i + 1}. ${a.name}${role}${marker}`);
   });
 
   // Move account to front
-  const idx = multiAuth.accounts.findIndex((a: any) => a.name === name);
+  const idx = data.accounts.findIndex((a: any) => a.name === name);
   if (idx === 0) {
     console.log(`\n  ✅ '${name}' is already the primary account\n`);
     return;
   }
 
-  const [removed] = multiAuth.accounts.splice(idx, 1);
-  multiAuth.accounts.unshift(removed);
+  const [removed] = data.accounts.splice(idx, 1);
+  data.accounts.unshift(removed);
 
   // New order
   console.log("\n  After:");
-  multiAuth.accounts.forEach((a: any, i: number) => {
+  data.accounts.forEach((a: any, i: number) => {
     const role = i === 0 ? " (primary)" : " (fallback)";
     console.log(`    ${i + 1}. ${a.name}${role}`);
   });
 
-  saveMultiAuth(multiAuth);
+  saveData(data);
   console.log(`\n  ✅ '${name}' is now the primary account`);
   console.log("     Restart OpenCode to apply changes\n");
 }
@@ -1940,7 +2000,8 @@ function cmdSetPrimary(name: string) {
 // ============================================================================
 
 function cmdList() {
-  const accounts = loadAccounts();
+  const data = loadData();
+  const accounts = data.accounts || [];
 
   if (!accounts.length) {
     console.log("\n  ❌ No accounts configured");
@@ -1953,8 +2014,6 @@ function cmdList() {
   console.log("\n  📋 Configured Accounts");
   console.log("  ────────────────────────────────────────\n");
 
-  const state = loadState();
-
   // Table header
   const nameW = Math.max(6, ...accounts.map((a: any) => a.name.length)) + 2;
   console.log(
@@ -1965,7 +2024,7 @@ function cmdList() {
   );
 
   accounts.forEach((account: any, i: number) => {
-    const isActive = state.currentAccount === account.name;
+    const isActive = data.currentAccount === account.name;
     const isApiKey = account.type === "api_key";
     const status = isApiKey
       ? "\u2705 API Key"
@@ -2020,22 +2079,22 @@ function cmdRemove(name: string) {
     return;
   }
 
-  const multiAuth = loadMultiAuth();
-  if (!multiAuth?.accounts?.length) {
+  const data = loadData();
+  if (!data.accounts?.length) {
     console.log("\n  ❌ No accounts configured\n");
     return;
   }
 
-  const idx = multiAuth.accounts.findIndex((a: any) => a.name === name);
+  const idx = data.accounts.findIndex((a: any) => a.name === name);
   if (idx < 0) {
-    const available = multiAuth.accounts.map((a: any) => a.name).join(", ");
+    const available = data.accounts.map((a: any) => a.name).join(", ");
     console.log(`\n  ❌ Account '${name}' not found`);
     console.log(`     Available accounts: ${available}`);
     console.log("     Run: bun src/cli.ts list\n");
     return;
   }
 
-  const account = multiAuth.accounts[idx];
+  const account = data.accounts[idx];
   const isPrimary = idx === 0;
 
   console.log(`\n  🗑️  Remove Account`);
@@ -2053,25 +2112,23 @@ function cmdRemove(name: string) {
     `    Status:    ${account.expires > Date.now() ? "✅ Authenticated" : "⚠️  Expired"}`,
   );
 
-  multiAuth.accounts.splice(idx, 1);
-  saveMultiAuth(multiAuth);
+  data.accounts.splice(idx, 1);
 
-  // Also remove from state
-  const state = loadState();
-  if (state.usage?.[name]) {
-    delete state.usage[name];
+  // Also remove usage data
+  if (data.usage?.[name]) {
+    delete data.usage[name];
   }
-  if (state.currentAccount === name) {
-    state.currentAccount = multiAuth.accounts[0]?.name || null;
+  if (data.currentAccount === name) {
+    data.currentAccount = data.accounts[0]?.name || null;
   }
-  saveState(state);
+  saveData(data);
 
   console.log(`\n  ✅ Account '${name}' removed`);
   console.log("     Tokens revoked and usage data cleared");
 
-  if (isPrimary && multiAuth.accounts.length > 0) {
+  if (isPrimary && data.accounts.length > 0) {
     console.log(
-      `     ⚡ '${multiAuth.accounts[0].name}' is now the primary account`,
+      `     ⚡ '${data.accounts[0].name}' is now the primary account`,
     );
   }
 
@@ -2205,19 +2262,18 @@ function cmdDiagnose() {
   console.log("\n  🔍 System Diagnostics");
   console.log("  ────────────────────────────────────────\n");
 
-  const multiAuth = loadMultiAuth();
-  const state = loadState();
+  const data = loadData();
   let issues = 0;
 
   // Check accounts
   console.log("  Accounts:");
-  if (!multiAuth?.accounts?.length) {
+  if (!data.accounts?.length) {
     console.log("    ❌ No accounts configured");
     console.log("       Run: bun src/cli.ts add <name>\n");
     issues++;
   } else {
-    console.log(`    ✅ Found ${multiAuth.accounts.length} account(s)`);
-    multiAuth.accounts.forEach((account: any, i: number) => {
+    console.log(`    ✅ Found ${data.accounts.length} account(s)`);
+    data.accounts.forEach((account: any, i: number) => {
       const isApiKey = account.type === "api_key";
       const isExpired = !isApiKey && account.expires <= Date.now();
       const status = isApiKey
@@ -2236,26 +2292,26 @@ function cmdDiagnose() {
 
   // Check state
   console.log("  State:");
-  if (state.currentAccount) {
-    console.log(`    ✅ Active account: ${state.currentAccount}`);
+  if (data.currentAccount) {
+    console.log(`    ✅ Active account: ${data.currentAccount}`);
   } else {
     console.log("    ⚠️  No active account set");
     issues++;
   }
-  console.log(`    ✅ Request count: ${state.requestCount || 0}`);
+  console.log(`    ✅ Request count: ${data.requestCount || 0}`);
 
-  if (state.usage) {
-    const accountNames = Object.keys(state.usage);
+  if (data.usage && Object.keys(data.usage).length > 0) {
+    const accountNames = Object.keys(data.usage);
     console.log(`    ✅ Usage data: ${accountNames.length} account(s)`);
   } else {
     console.log("    ⚠️  No usage data");
     issues++;
   }
 
-  if (state.config) {
-    const t = normalizeThresholds(state.config.threshold, DEFAULTS.threshold);
+  if (data.config) {
+    const t = normalizeThresholds(data.config.threshold, DEFAULTS.threshold);
     console.log(
-      `    ✅ Config: threshold ${Math.round(t.session5h * 100)}%/${Math.round(t.weekly7d * 100)}%/${Math.round(t.weekly7dSonnet * 100)}%, interval ${(state.config.checkInterval || DEFAULTS.checkInterval) / 60000}min`,
+      `    ✅ Config: threshold ${Math.round(t.session5h * 100)}%/${Math.round(t.weekly7d * 100)}%/${Math.round(t.weekly7dSonnet * 100)}%, interval ${(data.config.checkInterval || DEFAULTS.checkInterval) / 60000}min`,
     );
   }
   console.log();
@@ -2269,8 +2325,7 @@ function cmdDiagnose() {
 
   // File locations
   console.log("  Files:");
-  console.log(`    ✅ Accounts: ${MULTI_AUTH_FILE}`);
-  console.log(`    ✅ State:    ${STATE_FILE}`);
+  console.log(`    ✅ Data: ${DATA_FILE}`);
   console.log();
 
   // Summary
@@ -2279,13 +2334,13 @@ function cmdDiagnose() {
     console.log("  ✅ All checks passed — system is healthy");
   } else {
     console.log(`  ⚠️  ${issues} issue(s) found:`);
-    if (!multiAuth?.accounts?.length) {
+    if (!data.accounts?.length) {
       console.log("     - No accounts configured");
     }
-    if (multiAuth?.accounts?.some((a: any) => a.expires <= Date.now())) {
+    if (data.accounts?.some((a: any) => a.expires <= Date.now())) {
       console.log("     - Some accounts need re-authentication");
     }
-    if (!state.currentAccount) {
+    if (!data.currentAccount) {
       console.log("     - No active account set");
     }
   }
@@ -2303,10 +2358,15 @@ function cmdMigrate() {
   // Check for legacy files
   const legacyFiles = [
     {
-      path: LEGACY_MULTI_AUTH_FILE_CONFIG,
+      path: LEGACY_ACCOUNTS_FILE,
+      version: "v1.1.x (accounts file)",
+    },
+    {
+      path: LEGACY_ACCOUNTS_FILE_CONFIG,
       version: "v1.0.x (config dir)",
     },
-    { path: LEGACY_MULTI_AUTH_FILE, version: "v1.0.x (local dir)" },
+    { path: LEGACY_ACCOUNTS_FILE_LOCAL, version: "v1.0.x (local dir)" },
+    { path: LEGACY_STATE_FILE, version: "v1.1.x (state file)" },
   ];
 
   const foundLegacy = legacyFiles.filter((f) => existsSync(f.path));
@@ -2322,7 +2382,7 @@ function cmdMigrate() {
     console.log(`       Version: ${f.version}`);
   });
 
-  console.log(`\n  New location: ${MULTI_AUTH_FILE}\n`);
+  console.log(`\n  New location: ${DATA_FILE}\n`);
 
   console.log("  Migration will:");
   console.log("    1. Move accounts to new location");
@@ -2352,14 +2412,14 @@ async function cmdConfigInteractive() {
     input: process.stdin,
     output: process.stdout,
   });
-  const state = loadState();
-  state.config = state.config || {};
+  const data = loadData();
+  data.config = data.config || {};
 
   console.log("\n  ⚙️  Configuration Wizard");
   console.log("  ────────────────────────────────────────\n");
 
   const currentThresholds = normalizeThresholds(
-    state.config.threshold,
+    data.config.threshold,
     DEFAULTS.threshold,
   );
 
@@ -2374,7 +2434,7 @@ async function cmdConfigInteractive() {
     `    Weekly (Sonnet): ${Math.round(currentThresholds.weekly7dSonnet * 100)}%`,
   );
   console.log(
-    `    Check interval:  ${(state.config.checkInterval || DEFAULTS.checkInterval) / 60000} min\n`,
+    `    Check interval:  ${(data.config.checkInterval || DEFAULTS.checkInterval) / 60000} min\n`,
   );
 
   const ask = (q: string): Promise<string> =>
@@ -2405,7 +2465,7 @@ async function cmdConfigInteractive() {
     : currentThresholds.weekly7dSonnet;
   const intervalVal = interval
     ? parseInt(interval) * 60000
-    : state.config.checkInterval || DEFAULTS.checkInterval;
+    : data.config.checkInterval || DEFAULTS.checkInterval;
 
   // Preview
   console.log("\n  ┌─────────────────────────────────────────┐");
@@ -2425,14 +2485,14 @@ async function cmdConfigInteractive() {
   const confirm = await ask("  Apply these settings? (Y/n) ");
 
   if (confirm.toLowerCase() !== "n") {
-    state.config.threshold = {
+    data.config.threshold = {
       session5h: sessionVal,
       weekly7d: weeklyVal,
       weekly7dSonnet: sonnetVal,
     };
-    state.config.checkInterval = intervalVal;
-    autoEvaluate(state);
-    saveState(state);
+    data.config.checkInterval = intervalVal;
+    autoEvaluate(data);
+    saveData(data);
     console.log("\n  ✅ Configuration saved\n");
   } else {
     console.log("\n  ❌ Configuration cancelled\n");
@@ -2462,17 +2522,17 @@ function cmdSwitch(name: string) {
     return;
   }
 
-  const state = loadState();
-  const previous = state.currentAccount || accounts[0]?.name;
+  const data = loadData();
+  const previous = data.currentAccount || accounts[0]?.name;
 
   if (previous === name) {
     console.log(`\n  ✅ Already using '${name}'\n`);
     return;
   }
 
-  state.currentAccount = name;
-  state.lastPrimaryCheck = Date.now(); // Reset check timer
-  saveState(state);
+  data.currentAccount = name;
+  data.lastPrimaryCheck = Date.now(); // Reset check timer
+  saveData(data);
 
   console.log(`\n  ⚡ Switched: ${previous} → ${name}`);
   console.log(`  Active account is now '${name}'`);
