@@ -1718,19 +1718,18 @@ async function cmdReauth(alias: string, args: string[]) {
       return;
     }
 
-    // Interactive mode
+    // Interactive mode — detect auth type from existing account
+    const authType = account.type || (account.apiKey ? "api_key" : "oauth");
+
     console.log(`\n  \ud83d\udd10 Re-authenticating: ${alias}`);
     console.log(
       "  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n",
     );
-    console.log("  Choose authentication method:");
-    console.log("    1. Claude Pro/Max (OAuth)");
-    console.log("    2. Manually enter API Key\n");
+    console.log(
+      `  Auth type: ${authType === "api_key" ? "API Key" : "Claude Pro/Max (OAuth)"}\n`,
+    );
 
-    const method = await prompt("  ? Select method (1): ");
-    const choice = method.trim() || "1";
-
-    if (choice === "2") {
+    if (authType === "api_key") {
       // Manual API key
       const apiKey = await prompt("  ? Enter your API key: ");
       if (!apiKey) {
