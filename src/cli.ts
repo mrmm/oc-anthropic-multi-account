@@ -516,9 +516,46 @@ function renderUsage(watch: boolean) {
           : "\u26a0\ufe0f  Token expired";
     const reqCount = totalRequests;
     const lastUsed = relativeLastUsed(usage?.timestamp || null);
+
+    // Plan and cost info
+    const PLAN_PRICES_DISPLAY: Record<string, number> = {
+      pro: 20,
+      max5x: 100,
+      max20x: 200,
+    };
+    let planCostStr = "";
+    if (account.plan) {
+      const planType =
+        typeof account.plan === "object" ? account.plan.type : account.plan;
+      const planPrice =
+        typeof account.plan === "object"
+          ? account.plan.price
+          : PLAN_PRICES_DISPLAY[account.plan];
+      const planLabel =
+        planType === "pro"
+          ? "Pro"
+          : planType === "max5x"
+            ? "Max 5x"
+            : planType === "max20x"
+              ? "Max 20x"
+              : planType;
+      const monthCost = usage?.consumption?.currentMonth?.estimatedCost || 0;
+      if (planPrice) {
+        planCostStr = ` \u00b7 ${planLabel} \u00b7 $${Math.round(monthCost)}/$${planPrice} this month`;
+      }
+    }
+
     const statusLine = `${authStatus} \u00b7 ${isActive ? reqCount + " requests" : "0 requests"} \u00b7 ${isActive ? "last used " + lastUsed : "idle"}`;
     const statusInner = padToWidth(statusLine, CARD_W - 4);
     console.log(`  \u2502  ${statusInner}\u2502`);
+
+    // Plan/cost line (if plan is set)
+    if (planCostStr) {
+      const activeTag2 = isActive ? " \u25c4 ACTIVE" : "";
+      const planLine = `${account.name}${activeTag2}${planCostStr}`;
+      const planInner = padToWidth(planLine, CARD_W - 4);
+      console.log(`  \u2502  ${planInner}\u2502`);
+    }
 
     // Empty separator
     console.log(`  \u2502${" ".repeat(CARD_W - 2)}\u2502`);
@@ -721,10 +758,17 @@ function cmdConfig(args: string[]) {
 
   const accountName = parseArg("--account");
 
+  const PLAN_PRICES: Record<string, number> = {
+    pro: 20,
+    max5x: 100,
+    max20x: 200,
+  };
+
   // Per-account config mode
   if (accountName) {
     const accounts = data.accounts || [];
-    if (!accounts.find((a: any) => a.name === accountName)) {
+    const account = accounts.find((a: any) => a.name === accountName);
+    if (!account) {
       const available = accounts.map((a: any) => a.name).join(", ");
       console.error(`\n  ❌ Account '${accountName}' not found`);
       console.error(`     Available: ${available || "none"}\n`);
@@ -733,6 +777,60 @@ function cmdConfig(args: string[]) {
 
     data.config = data.config || {};
     data.config.accounts = data.config.accounts || {};
+
+    // Handle --plan flag
+    const planArg = parseArg("--plan");
+    if (planArg) {
+      const validPlans = ["pro", "max5x", "max20x"];
+      if (!validPlans.includes(planArg)) {
+        console.error(`\n  ❌ Invalid plan: '${planArg}'`);
+        console.error(`     Valid plans: ${validPlans.join(", ")}\n`);
+        return;
+      }
+      account.plan = { type: planArg, price: PLAN_PRICES[planArg] };
+      saveData(data);
+      console.log(
+        `\n  ✅ Plan set for '${accountName}': ${planArg} ($${PLAN_PRICES[planArg]}/month)\n`,
+      );
+      return;
+    }
+
+    // Handle --email flag
+    const emailArg = parseArg("--email");
+    if (emailArg) {
+      account.email = emailArg;
+      saveData(data);
+      console.log(`\n  ✅ Email set for '${accountName}': ${emailArg}\n`);
+      return;
+    }
+
+    // Handle --org flag
+    const orgArg = parseArg("--org");
+    if (orgArg) {
+      account.org = orgArg;
+      saveData(data);
+      console.log(`\n  ✅ Organization set for '${accountName}': ${orgArg}\n`);
+      return;
+    }
+
+    // Handle --extra-credit flag
+    const extraCreditArg = parseArg("--extra-credit");
+    if (extraCreditArg) {
+      const validModes = ["on", "off", "auto"];
+      if (!validModes.includes(extraCreditArg)) {
+        console.error(`\n  ❌ Invalid extra-credit mode: '${extraCreditArg}'`);
+        console.error(`     Valid modes: ${validModes.join(", ")}\n`);
+        return;
+      }
+      data.config.accounts[accountName] =
+        data.config.accounts[accountName] || {};
+      data.config.accounts[accountName].extraCredit = extraCreditArg;
+      saveData(data);
+      console.log(
+        `\n  ✅ Extra credit handling for '${accountName}': ${extraCreditArg}\n`,
+      );
+      return;
+    }
 
     // Show per-account config
     const hasThresholdArg =
@@ -752,6 +850,25 @@ function cmdConfig(args: string[]) {
 
       console.log(`\n  ⚙️  Configuration for account: ${accountName}`);
       console.log("  ────────────────────────────────────────\n");
+
+      // Show identity info
+      if (account.email) console.log(`    Email:             ${account.email}`);
+      if (account.org) console.log(`    Organization:      ${account.org}`);
+      if (account.plan) {
+        const planType =
+          typeof account.plan === "object" ? account.plan.type : account.plan;
+        const planPrice =
+          typeof account.plan === "object"
+            ? account.plan.price
+            : PLAN_PRICES[account.plan];
+        console.log(
+          `    Plan:              ${planType} ($${planPrice || "?"}/month)`,
+        );
+      }
+      const ecMode = data.config.accounts[accountName]?.extraCredit || "auto";
+      console.log(`    Extra credit:      ${ecMode}`);
+      if (account.email || account.org || account.plan) console.log();
+
       if (hasOverride) {
         console.log(`    Thresholds (per-account override):`);
       } else {
@@ -2918,6 +3035,14 @@ function showHelp() {
   CONFIGURATION
     config                           Show global configuration
     config --account <name>          Show account-specific config
+    config --account <name> --plan max5x
+                                     Set subscription plan (pro/max5x/max20x)
+    config --account <name> --email <email>
+                                     Set account email
+    config --account <name> --org <org>
+                                     Set account organization
+    config --account <name> --extra-credit on|off|auto
+                                     Set extra credit handling
     config --account <name> --threshold 0.95
                                      Set per-account threshold
     config --threshold 0.8           Set all global thresholds (0-1)
