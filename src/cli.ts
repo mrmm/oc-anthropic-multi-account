@@ -264,26 +264,39 @@ function saveState(state: any) {
 // Usage command
 // ============================================================================
 
-function progressBar(utilization: number): string {
-  const pct = Math.round(utilization * 100);
-  const filled = Math.floor(pct / 2);
-  const half = pct % 2 === 1 ? "▌" : "";
-  return (
-    "█".repeat(filled) +
-    half +
-    " ".repeat(Math.max(0, 50 - filled - (half ? 1 : 0)))
-  );
+function progressBar(
+  utilization: number,
+  threshold: number,
+  width: number = 35,
+): string {
+  const filled = Math.round(utilization * width);
+  const threshPos = Math.round(threshold * width);
+  let bar = "";
+  for (let i = 0; i < width; i++) {
+    if (i === threshPos && threshPos > 0 && threshPos < width) {
+      bar += "\x1b[2m\u2502\x1b[0m"; // dim │ threshold marker
+    } else if (i < filled) {
+      bar += "\u2501"; // ━ filled
+    } else {
+      bar += "\x1b[2m\u2501\x1b[0m"; // dim ━ empty
+    }
+  }
+  return bar;
 }
 
 function formatResetTime(ts: number | null): string {
-  if (!ts) return "Unknown";
-  return new Intl.DateTimeFormat("default", {
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-    timeZoneName: "short",
-  }).format(new Date(ts * 1000));
+  if (!ts) return "\u2014";
+  const now = Date.now();
+  const resetMs = ts * 1000;
+  const diffMs = resetMs - now;
+  if (diffMs <= 0) return "\u2014";
+  const totalMin = Math.floor(diffMs / 60000);
+  if (totalMin < 60) return `${totalMin}m`;
+  const hours = Math.floor(totalMin / 60);
+  const mins = totalMin % 60;
+  if (hours < 24) return mins > 0 ? `${hours}h ${mins}m` : `${hours}h`;
+  const days = Math.floor(hours / 24);
+  return `${days}d`;
 }
 
 const EMPTY_USAGE = {
@@ -328,10 +341,25 @@ function resolveStaleMetrics(state: any): boolean {
   return changed;
 }
 
-function colorize(text: string, util: number): string {
-  if (util >= 0.9) return `\x1b[31m${text}\x1b[0m`; // Red
-  if (util >= 0.7) return `\x1b[33m${text}\x1b[0m`; // Yellow
-  return `\x1b[32m${text}\x1b[0m`; // Green
+function colorize(text: string, util: number, threshold: number): string {
+  const ratio = threshold > 0 ? util / threshold : 0;
+  if (ratio >= 1) return `\x1b[31m${text}\x1b[0m`; // Red — over threshold
+  if (ratio >= 0.9) return `\x1b[33m${text}\x1b[0m`; // Yellow — 90-100% of threshold
+  if (ratio >= 0.7) return `\x1b[33m${text}\x1b[0m`; // Yellow — 70-90% of threshold
+  return `\x1b[32m${text}\x1b[0m`; // Green — under 70% of threshold
+}
+
+function relativeLastUsed(timestamp: string | null): string {
+  if (!timestamp) return "idle";
+  const diff = Date.now() - new Date(timestamp).getTime();
+  if (diff < 0) return "just now";
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
 }
 
 function renderUsage(watch: boolean) {
@@ -348,125 +376,165 @@ function renderUsage(watch: boolean) {
 
   if (watch) process.stdout.write("\x1b[2J\x1b[H");
 
+  const totalRequests = state.requestCount || 0;
+  const CARD_W = 72;
+
+  // Compact header
   console.log();
   console.log(
-    "  ┌─────────────────────────────────────────────────────────────┐",
-  );
-  console.log(
-    "  │  📊 Rate Limit Usage — anthropic-multi-account v1.1.0      │",
-  );
-  console.log(
-    "  └─────────────────────────────────────────────────────────────┘",
+    `  anthropic-multi-account v1.1.0 \u00b7 ${accounts.length} account${accounts.length !== 1 ? "s" : ""} \u00b7 ${totalRequests} requests`,
   );
 
   if (!accounts.length) {
-    console.log("\n  ❌ No accounts configured");
-    console.log(
-      "     Run: bun src/cli.ts add <name>    Add your first account\n",
-    );
+    console.log("\n  No accounts configured. Run: bun src/cli.ts add <name>\n");
     return;
   }
 
+  const t = normalizeThresholds(config.threshold, DEFAULTS.threshold);
+  const thresholdMap: Record<string, number> = {
+    session5h: t.session5h,
+    weekly7d: t.weekly7d,
+    weekly7dSonnet: t.weekly7dSonnet,
+  };
+
+  const BAR_W = 35;
+  const LABEL_W = 16;
+
   for (const account of accounts) {
     const isActive = state.currentAccount === account.name;
-    const c = isActive ? "\x1b[1;36m" : "";
-    const r = isActive ? "\x1b[0m" : "";
+    const usage = state.usage?.[account.name];
 
-    // Account status
-    const status =
-      account.expires > Date.now() ? "✅ Authenticated" : "⚠️  Token expired";
-    const bestQuota = isActive ? "  ✨ Best quota" : "";
-    console.log(
-      isActive
-        ? `\n${c}┌─ ${account.name} ◄── ACTIVE${bestQuota}${r}`
-        : `\n┌─ ${account.name}`,
-    );
-    console.log(`${c}│${r}  Status:    ${status}`);
-    console.log(`${c}│${r}  Auth:      Claude Max (OAuth)`);
-
-    if (!state.usage?.[account.name]) {
-      console.log(`${c}│${r}`);
-      console.log(`${c}│${r}  ⚠️  No usage data yet`);
-      console.log(`${c}│${r}     Run: bun src/cli.ts ping ${account.name}`);
-      console.log(`${c}└─${r}`);
-      continue;
+    // Top border with account name
+    const activeTag = isActive ? " \u25c4 ACTIVE" : "";
+    const titleContent = `\u2500 ${account.name}${activeTag} `;
+    const topPad = Math.max(0, CARD_W - 4 - titleContent.length);
+    const topBorder = `  \u250c${titleContent}${"\u2500".repeat(topPad)}\u2510`;
+    if (isActive) {
+      console.log(`\n\x1b[1;36m${topBorder}\x1b[0m`);
+    } else {
+      console.log(`\n${topBorder}`);
     }
 
-    const usage = state.usage[account.name];
-    const t = normalizeThresholds(config.threshold, DEFAULTS.threshold);
-    const thresholdMap = {
-      session5h: t.session5h,
-      weekly7d: t.weekly7d,
-      weekly7dSonnet: t.weekly7dSonnet,
-    };
+    // Status line
+    const authStatus =
+      account.expires > Date.now()
+        ? "\u2705 Authenticated"
+        : "\u26a0\ufe0f  Token expired";
+    const reqCount = totalRequests;
+    const lastUsed = relativeLastUsed(usage?.timestamp || null);
+    const statusLine = `${authStatus} \u00b7 ${isActive ? reqCount + " requests" : "0 requests"} \u00b7 ${isActive ? "last used " + lastUsed : "idle"}`;
+    const statusInner = padToWidth(statusLine, CARD_W - 4);
+    console.log(`  \u2502  ${statusInner}\u2502`);
 
-    for (const [label, key] of [
-      ["Session (5h)", "session5h"],
-      ["Weekly (all)", "weekly7d"],
-      ["Weekly (Sonnet)", "weekly7dSonnet"],
-    ] as const) {
-      const u = usage[key]?.utilization || 0;
-      const th = thresholdMap[key];
-      const thLabel = `\x1b[2m(threshold ${Math.round(th * 100)}%)\x1b[0m`;
+    // Empty separator
+    console.log(`  \u2502${" ".repeat(CARD_W - 2)}\u2502`);
 
-      console.log(`${c}│${r}\n${c}│${r}  📊 ${label}  ${thLabel}`);
-      console.log(
-        `${c}│${r}  ${colorize(progressBar(u), u)}  ${colorize(`${Math.round(u * 100)}%`, u)}`,
-      );
-      console.log(`${c}│${r}  Resets ${formatResetTime(usage[key]?.reset)}`);
+    if (!usage) {
+      const noData =
+        "\u26a0\ufe0f  No usage data \u2014 run: bun src/cli.ts ping " +
+        account.name;
+      const noDataInner = padToWidth(noData, CARD_W - 4);
+      console.log(`  \u2502  ${noDataInner}\u2502`);
+    } else {
+      // Metric rows
+      for (const [label, key] of [
+        ["Session (5h)", "session5h"],
+        ["Weekly (all)", "weekly7d"],
+        ["Weekly (Snnt)", "weekly7dSonnet"],
+      ] as const) {
+        const u = usage[key]?.utilization || 0;
+        const th = thresholdMap[key];
+        const pct = Math.round(u * 100);
+        const resetStr = formatResetTime(usage[key]?.reset);
+        const overMarker = u > th ? " !" : "";
 
-      // Status indicator based on utilization vs threshold
-      if (u > th) {
-        console.log(`${c}│${r}  Status: 🔴 Over threshold! Switch recommended`);
-      } else if (u > th * 0.9) {
-        console.log(
-          `${c}│${r}  Status: 🟡 Approaching threshold (${Math.round(u * 100)}% < ${Math.round(th * 100)}% warning)`,
-        );
-      } else if (u > th * 0.7) {
-        console.log(`${c}│${r}  Status: 🟡 Elevated usage (plan accordingly)`);
-      } else {
-        console.log(`${c}│${r}  Status: 🟢 Under threshold - optimal`);
+        // Build colored bar with threshold marker
+        const filledCount = Math.round(u * BAR_W);
+        let coloredBar = "";
+        for (let i = 0; i < BAR_W; i++) {
+          const isThreshPos =
+            i === Math.round(th * BAR_W) &&
+            Math.round(th * BAR_W) > 0 &&
+            Math.round(th * BAR_W) < BAR_W;
+          if (isThreshPos) {
+            coloredBar += "\x1b[2m\u2502\x1b[0m";
+          } else if (i < filledCount) {
+            const ratio = th > 0 ? u / th : 0;
+            if (ratio >= 1) coloredBar += "\x1b[31m\u2501\x1b[0m";
+            else if (ratio >= 0.7) coloredBar += "\x1b[33m\u2501\x1b[0m";
+            else coloredBar += "\x1b[32m\u2501\x1b[0m";
+          } else {
+            coloredBar += "\x1b[2m\u2501\x1b[0m";
+          }
+        }
+
+        const pctStr = `${pct}%${overMarker}`;
+        const pctColored = colorize(pctStr.padStart(5), u, th);
+        const resetColored = `\x1b[2m${resetStr.padEnd(6)}\x1b[0m`;
+
+        const lineContent = `${label.padEnd(LABEL_W)}${coloredBar} ${pctColored}  ${resetColored}`;
+        const lineInner = padToWidth(lineContent, CARD_W - 4);
+        console.log(`  \u2502  ${lineInner}\u2502`);
       }
     }
 
-    console.log(`${c}│${r}`);
-    console.log(`${c}│${r}  Requests:     ${state.requestCount || 0} total`);
-    console.log(
-      `${c}│${r}  Last Request: ${usage.timestamp ? new Date(usage.timestamp).toLocaleString() : "Never"}`,
-    );
-    console.log(`${c}└─${r}`);
+    // Bottom border
+    console.log(`  \u2514${"\u2500".repeat(CARD_W - 2)}\u2518`);
   }
 
-  console.log("");
+  // Summary line
+  const activeAcct = state.currentAccount || accounts[0]?.name || "none";
+  const threshStr = allSame(t)
+    ? `${Math.round(t.session5h * 100)}%`
+    : `${Math.round(t.session5h * 100)}/${Math.round(t.weekly7d * 100)}/${Math.round(t.weekly7dSonnet * 100)}%`;
+  const intervalMin = (config.checkInterval ?? DEFAULTS.checkInterval) / 60000;
+  console.log(
+    `\n  Active: ${activeAcct} \u00b7 Thresholds: ${threshStr} \u00b7 Check interval: ${intervalMin}m`,
+  );
 
   if (watch) {
+    const timeStr = new Date().toLocaleTimeString();
     console.log(
-      `  Updated: ${new Date().toLocaleTimeString()}  │  Ctrl+C to exit`,
+      `\n  \u2500\u2500\u2500 Updated ${timeStr} \u00b7 refreshes every 5s \u00b7 Ctrl+C to exit \u2500\u2500\u2500`,
     );
   }
 
-  // Tips
-  console.log("  ────────────────────────────────────────");
-  if (accounts.length > 1) {
-    const primary = accounts[0];
-    const primaryUsage = state.usage?.[primary.name];
-    const t = normalizeThresholds(config.threshold, DEFAULTS.threshold);
+  console.log();
+}
+
+function stripAnsi(str: string): string {
+  return str.replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+/** Approximate display width accounting for wide chars (emoji, CJK). */
+function displayWidth(str: string): number {
+  const plain = stripAnsi(str);
+  let w = 0;
+  for (const ch of plain) {
+    const cp = ch.codePointAt(0) || 0;
+    // Variation selectors / zero-width joiners
+    if (cp === 0xfe0f || cp === 0xfe0e || cp === 0x200d) continue;
+    // Common wide ranges: emoji, CJK, box-drawing (1-wide), etc.
     if (
-      primaryUsage &&
-      (primaryUsage.session5h?.utilization || 0) > t.session5h * 0.9
+      (cp >= 0x1f000 && cp <= 0x1ffff) || // Supplemental Symbols, Emoticons
+      (cp >= 0x2600 && cp <= 0x27bf) || // Misc Symbols, Dingbats
+      (cp >= 0x2702 && cp <= 0x27b0) ||
+      cp === 0x2705 || // ✅
+      cp === 0x26a0 || // ⚠
+      (cp >= 0x1f300 && cp <= 0x1f9ff)
     ) {
-      console.log(
-        `  ⚠️  Primary account (${primary.name}) is approaching threshold`,
-      );
-      console.log("     Run: bun src/cli.ts config --threshold 0.80");
+      w += 2;
+    } else {
+      w += 1;
     }
   }
-  console.log("  💡 Tips:");
-  console.log(
-    "     Run: bun src/cli.ts config --help    Configuration options",
-  );
-  console.log("     Run: bun src/cli.ts list              Account overview");
-  console.log();
+  return w;
+}
+
+function padToWidth(str: string, targetWidth: number): string {
+  const currentWidth = displayWidth(str);
+  const pad = Math.max(0, targetWidth - currentWidth);
+  return str + " ".repeat(pad);
 }
 
 function cmdUsage(args: string[]) {
