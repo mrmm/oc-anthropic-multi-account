@@ -1428,33 +1428,150 @@ function generateState(): string {
 }
 
 async function cmdAdd(args: string[]) {
-  const name = args[0];
+  let name = args[0];
   const authUrl = args[1]; // The authorization URL (contains state/verifier)
   const authCode = args[2]; // The auth code from callback
 
   if (!name) {
-    console.log("\n  \ud83d\udd10 Add Account");
-    console.log(
-      "  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n",
-    );
-    console.log("  Usage:");
-    console.log(
-      "    bun src/cli.ts add <name>                      Interactive (OAuth or API key)",
-    );
-    console.log(
-      "    bun src/cli.ts add <name> <auth-url> <code>    Direct OAuth mode (URL + code)",
-    );
-    console.log(
-      "    bun src/cli.ts add <name> <auth-url> <code#s>  Direct OAuth mode with state",
-    );
-    console.log();
-    return;
+    // Fully interactive mode — prompt for everything
+    clack.intro("Add Account");
+
+    const inputName = await clack.text({
+      message: "Account name (alias)",
+      placeholder: "e.g. primary, work, personal",
+      validate: (v) => {
+        if (!v) return "Name is required";
+        const data = loadData();
+        if (data.accounts?.find((a: any) => a.name === v))
+          return `Account '${v}' already exists`;
+        return undefined;
+      },
+    });
+    if (clack.isCancel(inputName)) {
+      clack.cancel("Cancelled");
+      return;
+    }
+
+    const inputEmail = await clack.text({
+      message: "Email (optional)",
+      placeholder: "user@example.com",
+    });
+    if (clack.isCancel(inputEmail)) {
+      clack.cancel("Cancelled");
+      return;
+    }
+
+    const inputOrg = await clack.text({
+      message: "Organization (optional)",
+      placeholder: "e.g. Pelico, Personal",
+    });
+    if (clack.isCancel(inputOrg)) {
+      clack.cancel("Cancelled");
+      return;
+    }
+
+    const inputPlan = await clack.select({
+      message: "Subscription plan",
+      options: [
+        { value: "team", label: "Team / Premium", hint: "$30/month" },
+        { value: "pro", label: "Pro", hint: "$20/month" },
+        { value: "max5x", label: "Max 5x", hint: "$100/month" },
+        { value: "max20x", label: "Max 20x", hint: "$200/month" },
+      ],
+    });
+    if (clack.isCancel(inputPlan)) {
+      clack.cancel("Cancelled");
+      return;
+    }
+
+    const inputAuth = await clack.select({
+      message: "Authentication method",
+      options: [
+        {
+          value: "oauth",
+          label: "Claude Pro/Max (OAuth)",
+          hint: "recommended",
+        },
+        { value: "api_key", label: "API Key", hint: "manual entry" },
+      ],
+    });
+    if (clack.isCancel(inputAuth)) {
+      clack.cancel("Cancelled");
+      return;
+    }
+
+    // Set name for rest of the function
+    args[0] = inputName as string;
+
+    if (inputAuth === "api_key") {
+      const apiKey = await clack.text({
+        message: "Enter your API key",
+        placeholder: "sk-ant-...",
+        validate: (v) => (!v ? "API key is required" : undefined),
+      });
+      if (clack.isCancel(apiKey)) {
+        clack.cancel("Cancelled");
+        return;
+      }
+
+      const data = loadData();
+      data.accounts ??= [];
+      const account = {
+        id: crypto.randomUUID(),
+        name: inputName as string,
+        email: (inputEmail as string) || null,
+        org: (inputOrg as string) || null,
+        plan: inputPlan
+          ? {
+              type: inputPlan as string,
+              price:
+                ({ pro: 20, team: 30, max5x: 100, max20x: 200 } as any)[
+                  inputPlan as string
+                ] || 0,
+            }
+          : null,
+        apiKey,
+        type: "api_key",
+      };
+      data.accounts.push(account);
+      saveData(data);
+
+      clack.outro(`Account '${inputName}' added with API key ✅`);
+      return;
+    }
+
+    // OAuth flow — fall through to the OAuth section below with name set
+    // First save the account stub with metadata
+    const data = loadData();
+    data.accounts ??= [];
+    const stub = {
+      id: crypto.randomUUID(),
+      name: inputName as string,
+      email: (inputEmail as string) || null,
+      org: (inputOrg as string) || null,
+      plan: inputPlan
+        ? {
+            type: inputPlan as string,
+            price:
+              ({ pro: 20, team: 30, max5x: 100, max20x: 200 } as any)[
+                inputPlan as string
+              ] || 0,
+          }
+        : null,
+      access: "",
+      refresh: "",
+      expires: 0,
+      type: "oauth",
+    };
+    data.accounts.push(stub);
+    saveData(data);
+
+    // Continue to the OAuth flow below (name is now set)
+    name = inputName as string;
   }
 
-  console.log(`\n  \ud83d\udd10 Adding account: ${name}`);
-  console.log(
-    "  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n",
-  );
+  console.log(`\n  🔐 Adding account: ${name}`);
+  console.log("  ────────────────────────────────────────\n");
 
   // Direct mode - URL and code provided (always OAuth)
   if (authUrl && authCode) {
