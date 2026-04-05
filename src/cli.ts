@@ -1023,14 +1023,34 @@ function autoEvaluate(state: any) {
 // Add account command
 // ============================================================================
 
+// Shared readline interface — reuse across multiple prompts to prevent
+// Bun from closing stdin when a readline instance is destroyed.
+let _rl: ReturnType<typeof readline.createInterface> | null = null;
+
+function getRL(): ReturnType<typeof readline.createInterface> {
+  if (!_rl) {
+    _rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+    _rl.on("close", () => {
+      _rl = null;
+    });
+  }
+  return _rl;
+}
+
+function closeRL() {
+  if (_rl) {
+    _rl.close();
+    _rl = null;
+  }
+}
+
 async function prompt(q: string): Promise<string> {
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
+  const rl = getRL();
   return new Promise((resolve) =>
     rl.question(q, (a) => {
-      rl.close();
       resolve(a.trim());
     }),
   );
@@ -2567,7 +2587,11 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+main()
+  .catch((err) => {
+    console.error(err);
+    process.exit(1);
+  })
+  .finally(() => {
+    closeRL();
+  });
