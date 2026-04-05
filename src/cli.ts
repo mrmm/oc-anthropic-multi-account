@@ -1251,12 +1251,14 @@ async function cmdAdd(args: string[]) {
   const input = await prompt("  ? Paste authorization code: ");
 
   let code: string;
-  // Try to parse as URL
+  // Try to parse as URL first
   try {
     const parsed = new URL(input);
     code = parsed.searchParams.get("code") || input;
   } catch {
-    code = input;
+    // Handle code#state format (strip the state suffix)
+    const authParsed = parseAuthCode(input);
+    code = authParsed.code;
   }
 
   console.log("\n  \u231b Exchanging code for tokens...");
@@ -1803,7 +1805,9 @@ async function cmdReauth(alias: string, args: string[]) {
       const parsed = new URL(input);
       code = parsed.searchParams.get("code") || input;
     } catch {
-      code = input;
+      // Handle code#state format (strip the state suffix)
+      const authParsed = parseAuthCode(input);
+      code = authParsed.code;
     }
 
     console.log("\n  \u231b Exchanging tokens...");
