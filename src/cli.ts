@@ -14,6 +14,7 @@ import {
 import { homedir } from "os";
 import { dirname, join } from "path";
 import * as readline from "readline";
+import * as clack from "@clack/prompts";
 
 const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
@@ -1542,16 +1543,32 @@ async function cmdAdd(args: string[]) {
   }
 
   // Interactive mode - choose auth method
-  console.log("  Choose authentication method:");
-  console.log("    1. Claude Pro/Max (OAuth)");
-  console.log("    2. Manually enter API Key\n");
+  clack.intro("Add Account");
 
-  const method = await prompt("  ? Select method (1): ");
-  const choice = method.trim() || "1";
+  const choice = await clack.select({
+    message: "Authentication method",
+    options: [
+      { value: "1", label: "Claude Pro/Max (OAuth)", hint: "recommended" },
+      { value: "2", label: "API Key", hint: "manual entry" },
+    ],
+  });
+
+  if (clack.isCancel(choice)) {
+    clack.cancel("Cancelled");
+    return;
+  }
 
   if (choice === "2") {
     // Manual API key
-    const apiKey = await prompt("  ? Enter your API key: ");
+    const apiKey = await clack.text({
+      message: "Enter your API key",
+      placeholder: "sk-ant-...",
+      validate: (v) => (!v ? "API key is required" : undefined),
+    });
+    if (clack.isCancel(apiKey)) {
+      clack.cancel("Cancelled");
+      return;
+    }
     if (!apiKey) {
       console.error("\n  \u274c No API key provided\n");
       return;
@@ -2445,9 +2462,13 @@ async function cmdReauth(alias: string, args: string[]) {
 
     if (authType === "api_key") {
       // Manual API key
-      const apiKey = await prompt("  ? Enter your API key: ");
-      if (!apiKey) {
-        console.error("\n  \u274c No API key provided\n");
+      const apiKey = await clack.text({
+        message: "Enter your API key",
+        placeholder: "sk-ant-...",
+        validate: (v) => (!v ? "API key is required" : undefined),
+      });
+      if (clack.isCancel(apiKey) || !apiKey) {
+        clack.cancel("Cancelled");
         return;
       }
 
@@ -3062,97 +3083,119 @@ function cmdMigrate() {
 // ============================================================================
 
 async function cmdConfigInteractive() {
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
   const data = loadData();
   data.config = data.config || {};
 
-  console.log("\n  ⚙️  Configuration Wizard");
-  console.log("  ────────────────────────────────────────\n");
+  const cur = normalizeThresholds(data.config.threshold, DEFAULTS.threshold);
+  const curInterval =
+    (data.config.checkInterval || DEFAULTS.checkInterval) / 60000;
+  const curMode = data.config.switchMode || "auto";
 
-  const currentThresholds = normalizeThresholds(
-    data.config.threshold,
-    DEFAULTS.threshold,
-  );
+  clack.intro("Configuration Wizard");
 
-  console.log("  Current settings:");
-  console.log(
-    `    Session (5h):    ${Math.round(currentThresholds.session5h * 100)}%`,
-  );
-  console.log(
-    `    Weekly (all):    ${Math.round(currentThresholds.weekly7d * 100)}%`,
-  );
-  console.log(
-    `    Weekly (Sonnet): ${Math.round(currentThresholds.weekly7dSonnet * 100)}%`,
-  );
-  console.log(
-    `    Check interval:  ${(data.config.checkInterval || DEFAULTS.checkInterval) / 60000} min\n`,
+  clack.note(
+    `Session (5h):    ${Math.round(cur.session5h * 100)}%\n` +
+      `Weekly (all):    ${Math.round(cur.weekly7d * 100)}%\n` +
+      `Weekly (Sonnet): ${Math.round(cur.weekly7dSonnet * 100)}%\n` +
+      `Check interval:  ${curInterval} min\n` +
+      `Switch mode:     ${curMode}`,
+    "Current Settings",
   );
 
-  const ask = (q: string): Promise<string> =>
-    new Promise((resolve) => rl.question(q, resolve));
-
-  const session = await ask(
-    `  Session (5h) threshold %  [${Math.round(currentThresholds.session5h * 100)}]: `,
-  );
-  const weekly = await ask(
-    `  Weekly (all) threshold %  [${Math.round(currentThresholds.weekly7d * 100)}]: `,
-  );
-  const sonnet = await ask(
-    `  Weekly (Sonnet) threshold %  [${Math.round(currentThresholds.weekly7dSonnet * 100)}]: `,
-  );
-  const interval = await ask(
-    `  Check interval (minutes)  [${(data.config.checkInterval || DEFAULTS.checkInterval) / 60000}]: `,
-  );
-
-  // Parse and validate
-  const sessionVal = session
-    ? parseFloat(session) / 100
-    : currentThresholds.session5h;
-  const weeklyVal = weekly
-    ? parseFloat(weekly) / 100
-    : currentThresholds.weekly7d;
-  const sonnetVal = sonnet
-    ? parseFloat(sonnet) / 100
-    : currentThresholds.weekly7dSonnet;
-  const intervalVal = interval
-    ? parseInt(interval) * 60000
-    : data.config.checkInterval || DEFAULTS.checkInterval;
-
-  // Preview
-  console.log("\n  ┌─────────────────────────────────────────┐");
-  console.log("  │  Preview                                 │");
-  console.log("  └─────────────────────────────────────────┘");
-  console.log(
-    `    Session (5h):    ${Math.round(sessionVal * 100)}%  (switch when exceeded)`,
-  );
-  console.log(
-    `    Weekly (all):    ${Math.round(weeklyVal * 100)}%  (switch when exceeded)`,
-  );
-  console.log(
-    `    Weekly (Sonnet): ${Math.round(sonnetVal * 100)}%  (switch when exceeded)`,
-  );
-  console.log(`    Check interval:  every ${intervalVal / 60000} minutes\n`);
-
-  const confirm = await ask("  Apply these settings? (Y/n) ");
-
-  if (confirm.toLowerCase() !== "n") {
-    data.config.threshold = {
-      session5h: sessionVal,
-      weekly7d: weeklyVal,
-      weekly7dSonnet: sonnetVal,
-    };
-    data.config.checkInterval = intervalVal;
-    autoEvaluate(data);
-    saveData(data);
-    console.log("\n  ✅ Configuration saved\n");
-  } else {
-    console.log("\n  ❌ Configuration cancelled\n");
+  const session = await clack.text({
+    message: "Session (5h) threshold %",
+    placeholder: String(Math.round(cur.session5h * 100)),
+    defaultValue: String(Math.round(cur.session5h * 100)),
+  });
+  if (clack.isCancel(session)) {
+    clack.cancel("Cancelled");
+    return;
   }
 
-  rl.close();
+  const weekly = await clack.text({
+    message: "Weekly (all) threshold %",
+    placeholder: String(Math.round(cur.weekly7d * 100)),
+    defaultValue: String(Math.round(cur.weekly7d * 100)),
+  });
+  if (clack.isCancel(weekly)) {
+    clack.cancel("Cancelled");
+    return;
+  }
+
+  const sonnet = await clack.text({
+    message: "Weekly (Sonnet) threshold %",
+    placeholder: String(Math.round(cur.weekly7dSonnet * 100)),
+    defaultValue: String(Math.round(cur.weekly7dSonnet * 100)),
+  });
+  if (clack.isCancel(sonnet)) {
+    clack.cancel("Cancelled");
+    return;
+  }
+
+  const interval = await clack.text({
+    message: "Check interval (minutes)",
+    placeholder: String(curInterval),
+    defaultValue: String(curInterval),
+  });
+  if (clack.isCancel(interval)) {
+    clack.cancel("Cancelled");
+    return;
+  }
+
+  const mode = await clack.select({
+    message: "Switch mode",
+    options: [
+      {
+        value: "auto",
+        label: "Auto",
+        hint: "switch accounts based on thresholds",
+      },
+      { value: "manual", label: "Manual", hint: "only switch manually" },
+    ],
+    initialValue: curMode,
+  });
+  if (clack.isCancel(mode)) {
+    clack.cancel("Cancelled");
+    return;
+  }
+
+  const sessionVal = session
+    ? parseFloat(session as string) / 100
+    : cur.session5h;
+  const weeklyVal = weekly ? parseFloat(weekly as string) / 100 : cur.weekly7d;
+  const sonnetVal = sonnet
+    ? parseFloat(sonnet as string) / 100
+    : cur.weekly7dSonnet;
+  const intervalVal = interval
+    ? parseInt(interval as string) * 60000
+    : data.config.checkInterval || DEFAULTS.checkInterval;
+
+  clack.note(
+    `Session (5h):    ${Math.round(sessionVal * 100)}%\n` +
+      `Weekly (all):    ${Math.round(weeklyVal * 100)}%\n` +
+      `Weekly (Sonnet): ${Math.round(sonnetVal * 100)}%\n` +
+      `Check interval:  ${intervalVal / 60000} min\n` +
+      `Switch mode:     ${mode}`,
+    "Preview",
+  );
+
+  const ok = await clack.confirm({ message: "Apply these settings?" });
+  if (clack.isCancel(ok) || !ok) {
+    clack.cancel("Configuration cancelled");
+    return;
+  }
+
+  data.config.threshold = {
+    session5h: sessionVal,
+    weekly7d: weeklyVal,
+    weekly7dSonnet: sonnetVal,
+  };
+  data.config.checkInterval = intervalVal;
+  data.config.switchMode = mode as string;
+  autoEvaluate(data);
+  saveData(data);
+
+  clack.outro("Configuration saved ✅");
 }
 
 // ============================================================================
