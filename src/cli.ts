@@ -1242,14 +1242,13 @@ async function cmdAdd(args: string[]) {
   url.searchParams.set("code_challenge_method", "S256");
   url.searchParams.set("state", state);
 
-  console.log("\n  Step 1: Open this URL in your browser:\n");
-  console.log(`    ${url.toString()}\n`);
-  console.log("  Step 2: Log in to your Anthropic Max account");
-  console.log(
-    "  Step 3: After approval, copy the FULL URL from your browser\n",
-  );
+  console.log("\n  1. Open this URL in your browser:\n");
+  console.log(`     ${url.toString()}\n`);
+  console.log("  2. Log in to your Anthropic Max account and authorize");
+  console.log("  3. Copy the authorization code shown after approval\n");
+  console.log("     (You can also paste the full callback URL — both work)\n");
 
-  const input = await prompt("  ? Paste the callback URL here: ");
+  const input = await prompt("  ? Paste authorization code: ");
 
   let code: string;
   // Try to parse as URL
@@ -1776,12 +1775,15 @@ async function cmdReauth(alias: string, args: string[]) {
     url.searchParams.set("code_challenge_method", "S256");
     url.searchParams.set("state", state);
 
-    console.log("\n  Step 1: Open this URL in your browser:\n");
-    console.log(`    ${url.toString()}\n`);
-    console.log("  Step 2: Log in and authorize");
-    console.log("  Step 3: Paste the callback URL or code below\n");
+    console.log("\n  1. Open this URL in your browser:\n");
+    console.log(`     ${url.toString()}\n`);
+    console.log("  2. Log in and authorize the application");
+    console.log("  3. Copy the authorization code shown after approval\n");
+    console.log(
+      "     (You can also paste the full callback URL — both work)\n",
+    );
 
-    const input = await prompt("  ? Paste here: ");
+    const input = await prompt("  ? Paste authorization code: ");
 
     let code: string;
     try {
