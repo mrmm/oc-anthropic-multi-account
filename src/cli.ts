@@ -23,7 +23,7 @@ import { cmdBar, cmdBarDetail } from "./sketchybar.js";
 const program = new Command();
 
 program
-  .name("oc-anth-ma")
+  .name("oc-multiauth")
   .description(
     "Manage multiple Anthropic accounts with automatic threshold-based failover.\n\n" +
       "Monitors session (5h) and weekly (7d) rate limits across accounts,\n" +
@@ -35,12 +35,12 @@ program
     "after",
     `
 Examples:
-  $ oc-anth-ma add                           Interactive account setup
-  $ oc-anth-ma add work                      Add account named "work"
-  $ oc-anth-ma usage -w                      Live usage dashboard
-  $ oc-anth-ma config --switch-mode manual   Disable auto-switching
-  $ oc-anth-ma switch fallback               Force switch to "fallback"
-  $ oc-anth-ma config --account work \\
+  $ oc-multiauth add                           Interactive account setup
+  $ oc-multiauth add work                      Add account named "work"
+  $ oc-multiauth usage -w                      Live usage dashboard
+  $ oc-multiauth config --switch-mode manual   Disable auto-switching
+  $ oc-multiauth switch fallback               Force switch to "fallback"
+  $ oc-multiauth config --account work \\
       --email me@co.com --org Acme --plan team
 `,
   );
@@ -63,9 +63,9 @@ program
     "after",
     `
 Examples:
-  $ oc-anth-ma add                           Full interactive wizard
-  $ oc-anth-ma add primary                   Interactive auth method
-  $ oc-anth-ma add primary <url> <code>      Direct OAuth (non-interactive)
+  $ oc-multiauth add                           Full interactive wizard
+  $ oc-multiauth add primary                   Interactive auth method
+  $ oc-multiauth add primary <url> <code>      Direct OAuth (non-interactive)
 `,
   )
   .action((_name, _opts, _cmd) => {
@@ -83,8 +83,8 @@ program
     "after",
     `
 Examples:
-  $ oc-anth-ma reauth primary                Interactive re-auth
-  $ oc-anth-ma reauth primary --api-key      Switch to API key auth
+  $ oc-multiauth reauth primary                Interactive re-auth
+  $ oc-multiauth reauth primary --api-key      Switch to API key auth
 `,
   )
   .action((name) => {
@@ -234,10 +234,10 @@ Options (pass-through):
     --reset              Reset account overrides
 
 Examples:
-  $ oc-anth-ma config                        Show current config
-  $ oc-anth-ma config --threshold 0.8        Set global threshold to 80%
-  $ oc-anth-ma config --switch-mode manual   Disable auto-switching
-  $ oc-anth-ma config --account work \\
+  $ oc-multiauth config                        Show current config
+  $ oc-multiauth config --threshold 0.8        Set global threshold to 80%
+  $ oc-multiauth config --switch-mode manual   Disable auto-switching
+  $ oc-multiauth config --account work \\
       --plan team --email me@co.com --org Acme
 `,
   )

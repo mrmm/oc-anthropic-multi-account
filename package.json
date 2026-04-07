@@ -1,11 +1,11 @@
 {
-  "name": "oc-anthropic-multi-account",
+  "name": "oc-multiauth",
   "version": "1.1.0",
   "type": "module",
-  "description": "OpenCode plugin for managing multiple Anthropic Max accounts with automatic failover based on rate limit utilization and modern OAuth implementation",
+  "description": "OpenCode plugin for managing multiple AI provider accounts with automatic failover based on rate limit utilization and modern OAuth implementation",
   "main": "dist/index.js",
   "bin": {
-    "oc-anthropic-multi-account": "dist/cli.js"
+    "oc-multiauth": "dist/cli.js"
   },
   "exports": {
     ".": "./dist/index.js"
