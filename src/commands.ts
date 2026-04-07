@@ -16,7 +16,7 @@ import {
   LEGACY_ACCOUNTS_FILE_LOCAL,
   LEGACY_STATE_FILE,
 } from "./constants.js";
-import { loadData, saveData, loadAccounts } from "./data.js";
+import { loadData, saveData, loadAccounts, upsertAccount } from "./data.js";
 import { normalizeThresholds, getAccountThresholds } from "./thresholds.js";
 import { autoEvaluate, logSwitch } from "./auto-evaluate.js";
 import { refreshToken, prompt, createOAuthTokenRequestInit } from "./oauth.js";
@@ -538,29 +538,13 @@ export async function cmdReauth(alias: string, args: string[]) {
         expires_in: number;
       };
       const reauthData = loadData();
-      reauthData.accounts ??= [];
-      const updated: any = {
-        id: crypto.randomUUID(),
-        name: alias,
-        email: null,
-        org: null,
-        plan: null,
+      const updated = upsertAccount(reauthData, alias, {
         access: json.access_token,
         refresh: json.refresh_token,
         expires: Date.now() + json.expires_in * 1000,
         type: "oauth",
-      };
-      const idx = reauthData.accounts.findIndex((a: any) => a.name === alias);
-      if (idx >= 0) {
-        updated.id = reauthData.accounts[idx].id || updated.id;
-        updated.email = reauthData.accounts[idx].email || null;
-        updated.org = reauthData.accounts[idx].org || null;
-        updated.plan = reauthData.accounts[idx].plan || null;
-        reauthData.accounts[idx] = updated;
-      } else {
-        reauthData.accounts.push(updated);
-      }
-      saveData(reauthData);
+      });
+      saveData(updated);
       console.log(JSON.stringify({ status: "ok", alias }));
       return;
     }
@@ -622,31 +606,12 @@ export async function cmdReauth(alias: string, args: string[]) {
       }
 
       const reauthApiData = loadData();
-      reauthApiData.accounts ??= [];
-      const updated: any = {
-        id: crypto.randomUUID(),
-        name: alias,
-        email: null,
-        org: null,
-        plan: null,
+      const updated = upsertAccount(reauthApiData, alias, {
         apiKey,
         type: "api_key",
-      };
-
-      const idx = reauthApiData.accounts.findIndex(
-        (a: any) => a.name === alias,
-      );
-      if (idx >= 0) {
-        updated.id = reauthApiData.accounts[idx].id || updated.id;
-        updated.email = reauthApiData.accounts[idx].email || null;
-        updated.org = reauthApiData.accounts[idx].org || null;
-        updated.plan = reauthApiData.accounts[idx].plan || null;
-        reauthApiData.accounts[idx] = updated;
-      } else {
-        reauthApiData.accounts.push(updated);
-      }
-      saveData(reauthApiData);
-      console.log(`\n  \u2705 API key saved for '${alias}'\n`);
+      });
+      saveData(updated);
+      console.log(`\n  ✅ API key saved for '${alias}'\n`);
       return;
     }
 
@@ -716,34 +681,16 @@ export async function cmdReauth(alias: string, args: string[]) {
       expires_in: number;
     };
     const reauthOauthData = loadData();
-    reauthOauthData.accounts ??= [];
-    const updated: any = {
-      id: crypto.randomUUID(),
-      name: alias,
-      email: null,
-      org: null,
-      plan: null,
+    const updated = upsertAccount(reauthOauthData, alias, {
       access: json.access_token,
       refresh: json.refresh_token,
       expires: Date.now() + json.expires_in * 1000,
       type: "oauth",
-    };
-    const idx = reauthOauthData.accounts.findIndex(
-      (a: any) => a.name === alias,
-    );
-    if (idx >= 0) {
-      updated.id = reauthOauthData.accounts[idx].id || updated.id;
-      updated.email = reauthOauthData.accounts[idx].email || null;
-      updated.org = reauthOauthData.accounts[idx].org || null;
-      updated.plan = reauthOauthData.accounts[idx].plan || null;
-      reauthOauthData.accounts[idx] = updated;
-    } else {
-      reauthOauthData.accounts.push(updated);
-    }
-    saveData(reauthOauthData);
+    });
+    saveData(updated);
 
     const expiresMin = Math.round(json.expires_in / 60);
-    console.log(`  \u2705 Account '${alias}' re-authenticated`);
+    console.log(`  ✅ Account '${alias}' re-authenticated`);
     console.log(`     Expires in ${expiresMin} minutes\n`);
     console.log(`  Run: bun src/cli.ts test ${alias}    Verify connectivity\n`);
   } catch (err) {

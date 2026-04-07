@@ -197,3 +197,61 @@ export function saveData(data: any) {
 export function loadAccounts() {
   return loadData().accounts || [];
 }
+
+// ============================================================================
+// Account Upsert Helper
+// ============================================================================
+
+/**
+ * Upsert an account into the data, preserving existing fields on reauth.
+ *
+ * CRITICAL: This function preserves:
+ * - id (account identity)
+ * - email, org, plan (user metadata)
+ * - usage (rate limits and consumption tracking)
+ *
+ * @param data - The current data object
+ * @param accountName - The account name to find or create
+ * @param newFields - Fields to set/update (access, refresh, expires, apiKey, type)
+ * @returns A new data object with the account upserted (does NOT mutate input)
+ */
+export function upsertAccount(
+  data: any,
+  accountName: string,
+  newFields: any,
+): any {
+  // Deep clone to avoid mutation
+  const result = JSON.parse(JSON.stringify(data));
+  result.accounts = result.accounts || [];
+
+  const idx = result.accounts.findIndex((a: any) => a.name === accountName);
+
+  // Create base account object
+  const updated: any = {
+    id: crypto.randomUUID(),
+    name: accountName,
+    email: null,
+    org: null,
+    plan: null,
+    ...newFields,
+  };
+
+  if (idx >= 0) {
+    // EXISTING ACCOUNT: Preserve identity and usage data
+    const existing = result.accounts[idx];
+    updated.id = existing.id || updated.id;
+    updated.email = existing.email || null;
+    updated.org = existing.org || null;
+    updated.plan = existing.plan || null;
+    // CRITICAL: Preserve usage data (rate limits + consumption)
+    if (existing.usage !== undefined) {
+      updated.usage = existing.usage;
+    }
+    result.accounts[idx] = updated;
+  } else {
+    // NEW ACCOUNT: Just add it
+    result.accounts.push(updated);
+  }
+
+  return result;
+}

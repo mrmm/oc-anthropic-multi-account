@@ -8,7 +8,7 @@ import {
   TOKEN_URL,
   OAUTH_SCOPES,
 } from "./constants.js";
-import { loadData, saveData } from "./data.js";
+import { loadData, saveData, upsertAccount } from "./data.js";
 
 export function createOAuthTokenRequestInit(
   params: Record<string, string | undefined>,
@@ -289,34 +289,15 @@ export async function cmdAdd(args: string[]) {
       expires_in: number;
     };
     const data = loadData();
-    data.accounts ??= [];
-
-    const account = {
-      id: crypto.randomUUID(),
-      name,
-      email: null as string | null,
-      org: null as string | null,
-      plan: null as string | null,
+    const updated = upsertAccount(data, name, {
       access: json.access_token,
       refresh: json.refresh_token,
       expires: Date.now() + json.expires_in * 1000,
       type: "oauth",
-    };
-    const idx = data.accounts.findIndex((a: any) => a.name === name);
+    });
+    saveData(updated);
 
-    if (idx >= 0) {
-      account.id = data.accounts[idx].id || account.id;
-      account.email = data.accounts[idx].email || null;
-      account.org = data.accounts[idx].org || null;
-      account.plan = data.accounts[idx].plan || null;
-      data.accounts[idx] = account;
-      console.log(`\n  \u2705 Account '${name}' updated`);
-    } else {
-      data.accounts.push(account);
-      console.log(`\n  \u2705 Account '${name}' added`);
-    }
-
-    saveData(data);
+    console.log(`\n  ✅ Account '${name}' added`);
     console.log("     Restart OpenCode to use the new account");
     console.log(`     Run: bun src/cli.ts usage    View usage metrics\n`);
     return;
@@ -355,32 +336,13 @@ export async function cmdAdd(args: string[]) {
     }
 
     const data = loadData();
-    data.accounts ??= [];
-
-    const account = {
-      id: crypto.randomUUID(),
-      name,
-      email: null as string | null,
-      org: null as string | null,
-      plan: null as string | null,
+    const updated = upsertAccount(data, name, {
       apiKey,
       type: "api_key",
-    };
-    const idx = data.accounts.findIndex((a: any) => a.name === name);
+    });
+    saveData(updated);
 
-    if (idx >= 0) {
-      account.id = data.accounts[idx].id || account.id;
-      account.email = data.accounts[idx].email || null;
-      account.org = data.accounts[idx].org || null;
-      account.plan = data.accounts[idx].plan || null;
-      data.accounts[idx] = account;
-      console.log(`\n  \u2705 Account '${name}' updated with API key`);
-    } else {
-      data.accounts.push(account);
-      console.log(`\n  \u2705 Account '${name}' added with API key`);
-    }
-
-    saveData(data);
+    console.log(`\n  ✅ Account '${name}' added with API key`);
     console.log("     Restart OpenCode to use the new account");
     console.log(`     Run: bun src/cli.ts usage    View usage metrics\n`);
     return;
@@ -449,34 +411,15 @@ export async function cmdAdd(args: string[]) {
     expires_in: number;
   };
   const data = loadData();
-  data.accounts ??= [];
-
-  const account = {
-    id: crypto.randomUUID(),
-    name,
-    email: null as string | null,
-    org: null as string | null,
-    plan: null as string | null,
+  const updated = upsertAccount(data, name, {
     access: json.access_token,
     refresh: json.refresh_token,
     expires: Date.now() + json.expires_in * 1000,
     type: "oauth",
-  };
-  const idx = data.accounts.findIndex((a: any) => a.name === name);
+  });
+  saveData(updated);
 
-  if (idx >= 0) {
-    account.id = data.accounts[idx].id || account.id;
-    account.email = data.accounts[idx].email || null;
-    account.org = data.accounts[idx].org || null;
-    account.plan = data.accounts[idx].plan || null;
-    data.accounts[idx] = account;
-    console.log(`\n  \u2705 Account '${name}' updated`);
-  } else {
-    data.accounts.push(account);
-    console.log(`\n  \u2705 Account '${name}' added`);
-  }
-
-  saveData(data);
+  console.log(`\n  ✅ Account '${name}' added`);
   console.log("     Restart OpenCode to use the new account");
   console.log(`     Run: bun src/cli.ts usage    View usage metrics\n`);
 }
