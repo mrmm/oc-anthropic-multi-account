@@ -7,6 +7,16 @@ import {
   getAccountThresholds,
 } from "./thresholds.js";
 import { autoEvaluate } from "./auto-evaluate.js";
+import {
+  success,
+  error,
+  warning,
+  info,
+  plain,
+  header,
+  kv,
+  availableAccounts,
+} from "./ui-utils.js";
 
 export function cmdConfig(args: string[]) {
   const data = loadData();
@@ -31,8 +41,9 @@ export function cmdConfig(args: string[]) {
     const account = accounts.find((a: any) => a.name === accountName);
     if (!account) {
       const available = accounts.map((a: any) => a.name).join(", ");
-      console.error(`\n  ❌ Account '${accountName}' not found`);
-      console.error(`     Available: ${available || "none"}\n`);
+      error(`Account '${accountName}' not found`);
+      availableAccounts(accounts.map((a: any) => a.name));
+      console.log();
       return;
     }
 
@@ -46,13 +57,14 @@ export function cmdConfig(args: string[]) {
     if (planArg) {
       const validPlans = ["pro", "team", "max5x", "max20x"];
       if (!validPlans.includes(planArg)) {
-        console.error(`\n  ❌ Invalid plan: '${planArg}'`);
-        console.error(`     Valid plans: ${validPlans.join(", ")}\n`);
+        error(`Invalid plan: '${planArg}'`);
+        info(`Valid plans: ${validPlans.join(", ")}`, 2);
+        console.log();
         return;
       }
       account.plan = { type: planArg, price: PLAN_PRICES[planArg] };
-      console.log(
-        `  ✅ Plan set for '${accountName}': ${planArg} ($${PLAN_PRICES[planArg]}/month)`,
+      success(
+        `Plan set for '${accountName}': ${planArg} ($$${PLAN_PRICES[planArg]}/month)`,
       );
       accountChanged = true;
     }
@@ -60,14 +72,14 @@ export function cmdConfig(args: string[]) {
     const emailArg = parseArg("--email");
     if (emailArg) {
       account.email = emailArg;
-      console.log(`  ✅ Email set for '${accountName}': ${emailArg}`);
+      success(`Email set for '${accountName}': ${emailArg}`);
       accountChanged = true;
     }
 
     const orgArg = parseArg("--org");
     if (orgArg) {
       account.org = orgArg;
-      console.log(`  ✅ Organization set for '${accountName}': ${orgArg}`);
+      success(`Organization set for '${accountName}': ${orgArg}`);
       accountChanged = true;
     }
 
@@ -82,17 +94,18 @@ export function cmdConfig(args: string[]) {
     if (extraCreditArg) {
       const validModes = ["on", "off", "auto"];
       if (!validModes.includes(extraCreditArg)) {
-        console.error(`\n  ❌ Invalid extra-credit mode: '${extraCreditArg}'`);
-        console.error(`     Valid modes: ${validModes.join(", ")}\n`);
+        error(`Invalid extra-credit mode: '${extraCreditArg}'`);
+        info(`Valid modes: ${validModes.join(", ")}`, 2);
+        console.log();
         return;
       }
       data.config.accounts[accountName] =
         data.config.accounts[accountName] || {};
       data.config.accounts[accountName].extraCredit = extraCreditArg;
       saveData(data);
-      console.log(
-        `\n  ✅ Extra credit handling for '${accountName}': ${extraCreditArg}\n`,
-      );
+      console.log();
+      success(`Extra credit handling for '${accountName}': ${extraCreditArg}`);
+      console.log();
       return;
     }
 
@@ -112,12 +125,10 @@ export function cmdConfig(args: string[]) {
       );
       const hasOverride = !!data.config.accounts[accountName]?.threshold;
 
-      console.log(`\n  ⚙️  Configuration for account: ${accountName}`);
-      console.log("  ────────────────────────────────────────\n");
+      header(`Configuration for account: ${accountName}`);
 
-      // Show identity info
-      if (account.email) console.log(`    Email:             ${account.email}`);
-      if (account.org) console.log(`    Organization:      ${account.org}`);
+      if (account.email) kv("Email:", account.email);
+      if (account.org) kv("Organization:", account.org);
       if (account.plan) {
         const planType =
           typeof account.plan === "object" ? account.plan.type : account.plan;
@@ -125,33 +136,32 @@ export function cmdConfig(args: string[]) {
           typeof account.plan === "object"
             ? account.plan.price
             : PLAN_PRICES[account.plan];
-        console.log(
-          `    Plan:              ${planType} ($${planPrice || "?"}/month)`,
-        );
+        kv("Plan:", `${planType} ($$${planPrice || "?"}/month)`);
       }
       const ecMode = data.config.accounts[accountName]?.extraCredit || "auto";
-      console.log(`    Extra credit:      ${ecMode}`);
+      kv("Extra credit:", ecMode);
       if (account.email || account.org || account.plan) console.log();
 
       if (hasOverride) {
-        console.log(`    Thresholds (per-account override):`);
+        plain("    Thresholds (per-account override):");
       } else {
-        console.log(`    Thresholds (using global defaults):`);
+        plain("    Thresholds (using global defaults):");
       }
-      console.log(`      Session (5h):    ${Math.round(t.session5h * 100)}%`);
-      console.log(`      Weekly (all):    ${Math.round(t.weekly7d * 100)}%`);
-      console.log(
-        `      Weekly (Sonnet): ${Math.round(t.weekly7dSonnet * 100)}%`,
-      );
+      plain(`      Session (5h):    ${Math.round(t.session5h * 100)}%`);
+      plain(`      Weekly (all):    ${Math.round(t.weekly7d * 100)}%`);
+      plain(`      Weekly (Sonnet): ${Math.round(t.weekly7dSonnet * 100)}%`);
       if (hasOverride) {
         const gStr = allSame(globalT)
           ? `${Math.round(globalT.session5h * 100)}%`
           : `${Math.round(globalT.session5h * 100)}/${Math.round(globalT.weekly7d * 100)}/${Math.round(globalT.weekly7dSonnet * 100)}%`;
-        console.log(`\n    Global fallback:   ${gStr}`);
+        console.log();
+        kv("Global fallback:", gStr);
       }
-      console.log(
-        `\n  💡 Run: bun src/cli.ts config --account ${accountName} --threshold 0.80\n`,
+      console.log();
+      info(
+        `Run: bun src/cli.ts config --account ${accountName} --threshold 0.80`,
       );
+      console.log();
       return;
     }
 
@@ -162,9 +172,11 @@ export function cmdConfig(args: string[]) {
         delete data.config.accounts;
       }
       saveData(data);
-      console.log(
-        `\n  ✅ Per-account config for '${accountName}' removed (using global defaults)\n`,
+      console.log();
+      success(
+        `Per-account config for '${accountName}' removed (using global defaults)`,
       );
+      console.log();
       return;
     }
 
@@ -176,9 +188,8 @@ export function cmdConfig(args: string[]) {
     if (t) {
       const val = parseFloat(t);
       if (isNaN(val) || val < 0 || val > 1) {
-        console.error(
-          "\n  ❌ Invalid threshold value. Must be between 0 and 1\n",
-        );
+        error("Invalid threshold value. Must be between 0 and 1");
+        console.log();
         return;
       }
       data.config.accounts[accountName].threshold = val;
@@ -189,9 +200,10 @@ export function cmdConfig(args: string[]) {
     if (ta) {
       const parts = ta.split(",").map(Number);
       if (parts.length !== 3 || parts.some(isNaN)) {
-        console.error(
-          "\n  ❌ Invalid --thresholds format. Expected: <session>,<weekly>,<sonnet>\n",
+        error(
+          "Invalid --thresholds format. Expected: <session>,<weekly>,<sonnet>",
         );
+        console.log();
         return;
       }
       data.config.accounts[accountName].threshold = {
@@ -239,7 +251,8 @@ export function cmdConfig(args: string[]) {
     if (changed) {
       autoEvaluate(data);
       saveData(data);
-      console.log(`\n  ✅ Per-account config for '${accountName}' saved`);
+      console.log();
+      success(`Per-account config for '${accountName}' saved`);
       cmdConfig(["--account", accountName]);
     }
     return;
@@ -250,27 +263,25 @@ export function cmdConfig(args: string[]) {
     const cfg = data.config || {};
     const t = normalizeThresholds(cfg.threshold, DEFAULTS.threshold);
 
-    console.log("\n  ⚙️  Current Configuration");
-    console.log("  ────────────────────────────────────────\n");
+    header("Current Configuration");
     if (allSame(t)) {
-      console.log(`    Threshold:         ${Math.round(t.session5h * 100)}%`);
+      kv("Threshold:", `${Math.round(t.session5h * 100)}%`);
     } else {
-      console.log(`    Thresholds:`);
-      console.log(`      Session (5h):    ${Math.round(t.session5h * 100)}%`);
-      console.log(`      Weekly (all):    ${Math.round(t.weekly7d * 100)}%`);
-      console.log(
-        `      Weekly (Sonnet): ${Math.round(t.weekly7dSonnet * 100)}%`,
-      );
+      plain("    Thresholds:");
+      plain(`      Session (5h):    ${Math.round(t.session5h * 100)}%`);
+      plain(`      Weekly (all):    ${Math.round(t.weekly7d * 100)}%`);
+      plain(`      Weekly (Sonnet): ${Math.round(t.weekly7dSonnet * 100)}%`);
     }
-    console.log(
-      `    Check interval:    ${(cfg.checkInterval ?? DEFAULTS.checkInterval) / 60000} min`,
+    kv(
+      "Check interval:",
+      `${(cfg.checkInterval ?? DEFAULTS.checkInterval) / 60000} min`,
     );
-    console.log(`    Switch mode:       ${cfg.switchMode || "auto"}`);
+    kv("Switch mode:", cfg.switchMode || "auto");
 
-    // Show per-account overrides if any exist
     const accountOverrides = cfg.accounts;
     if (accountOverrides && Object.keys(accountOverrides).length > 0) {
-      console.log("\n    Per-account overrides:");
+      console.log();
+      plain("    Per-account overrides:");
       for (const [name, acctCfg] of Object.entries(accountOverrides) as [
         string,
         any,
@@ -278,9 +289,9 @@ export function cmdConfig(args: string[]) {
         if (acctCfg?.threshold) {
           const at = getAccountThresholds(name, cfg);
           if (allSame(at)) {
-            console.log(`      ${name}: ${Math.round(at.session5h * 100)}%`);
+            plain(`      ${name}: ${Math.round(at.session5h * 100)}%`);
           } else {
-            console.log(
+            plain(
               `      ${name}: ${Math.round(at.session5h * 100)}/${Math.round(at.weekly7d * 100)}/${Math.round(at.weekly7dSonnet * 100)}%`,
             );
           }
@@ -288,19 +299,21 @@ export function cmdConfig(args: string[]) {
       }
     }
 
-    console.log(
-      "\n  💡 Run: bun src/cli.ts config --threshold 0.80    Change thresholds\n",
-    );
+    console.log();
+    info("Run: bun src/cli.ts config --threshold 0.80    Change thresholds");
+    console.log();
     return;
   }
 
   if (args.includes("--reset")) {
     data.config = structuredClone(EMPTY_DATA.config);
     saveData(data);
-    console.log("\n  ✅ Configuration reset to defaults");
+    console.log();
+    success("Configuration reset to defaults");
     console.log(
-      `     Threshold: ${Math.round(DEFAULTS.threshold * 100)}%  |  Check interval: ${DEFAULTS.checkInterval / 60000} min\n`,
+      `     Threshold: ${Math.round(DEFAULTS.threshold * 100)}%  |  Check interval: ${DEFAULTS.checkInterval / 60000} min`,
     );
+    console.log();
     return;
   }
 
@@ -328,21 +341,18 @@ export function cmdConfig(args: string[]) {
   if (t) {
     const val = parseFloat(t);
     if (isNaN(val) || val < 0 || val > 1) {
-      console.error(
-        "\n  ❌ Invalid threshold value. Must be between 0 and 1 (e.g., 0.80 for 80%)",
+      error(
+        "Invalid threshold value. Must be between 0 and 1 (e.g., 0.80 for 80%)",
       );
-      console.error("     Run: bun src/cli.ts config --threshold 0.80\n");
+      info("Run: bun src/cli.ts config --threshold 0.80", 2);
+      console.log();
       return;
     }
     if (val < 0.5) {
-      console.warn(
-        "\n  ⚠️  Threshold below 50% may cause frequent account switching",
-      );
+      warning("Threshold below 50% may cause frequent account switching");
     }
     if (val > 0.95) {
-      console.warn(
-        "\n  ⚠️  Threshold above 95% increases risk of hitting rate limits",
-      );
+      warning("Threshold above 95% increases risk of hitting rate limits");
     }
     data.config.threshold = val;
     changed = true;
@@ -353,10 +363,11 @@ export function cmdConfig(args: string[]) {
   if (ta) {
     const parts = ta.split(",").map(Number);
     if (parts.length !== 3 || parts.some(isNaN)) {
-      console.error(
-        "\n  ❌ Invalid --thresholds format. Expected: <session>,<weekly>,<sonnet>",
+      error(
+        "Invalid --thresholds format. Expected: <session>,<weekly>,<sonnet>",
       );
-      console.error("     Run: bun src/cli.ts config --thresholds 95,80,90\n");
+      info("Run: bun src/cli.ts config --thresholds 95,80,90", 2);
+      console.log();
       return;
     }
     data.config.threshold = {
@@ -398,7 +409,8 @@ export function cmdConfig(args: string[]) {
   const sm = parseArg("--switch-mode");
   if (sm) {
     if (sm !== "auto" && sm !== "manual") {
-      console.log("\n  ❌ --switch-mode must be 'auto' or 'manual'");
+      error("--switch-mode must be 'auto' or 'manual'");
+      console.log();
       return;
     }
     data.config.switchMode = sm;
@@ -411,7 +423,8 @@ export function cmdConfig(args: string[]) {
   if (changed) {
     autoEvaluate(data);
     saveData(data);
-    console.log("\n  ✅ Configuration saved");
+    console.log();
+    success("Configuration saved");
     cmdConfig(["--show"]);
   }
 }
@@ -533,5 +546,5 @@ export async function cmdConfigInteractive() {
   autoEvaluate(data);
   saveData(data);
 
-  clack.outro("Configuration saved ✅");
+  clack.outro("Configuration saved");
 }

@@ -16,6 +16,7 @@ import {
   LEGACY_STATE_FILE,
   LEGACY_STATE_FILE_LOCAL,
 } from "./constants.js";
+import { warning, info, error } from "./ui-utils.js";
 
 // ============================================================================
 // File helpers (atomic write + backup fallback)
@@ -27,7 +28,7 @@ export function safeReadJSON<T>(filePath: string, fallback: T): T {
     try {
       const data = JSON.parse(readFileSync(path, "utf-8"));
       if (path.endsWith(".bak")) {
-        console.log(`  ⚠️  Recovered ${filePath} from backup`);
+        warning(`Recovered ${filePath} from backup`, 2);
       }
       return data;
     } catch {
@@ -47,7 +48,7 @@ export function safeWriteJSON(filePath: string, data: any) {
     writeFileSync(tmp, JSON.stringify(data, null, 2));
     renameSync(tmp, filePath);
   } catch (e) {
-    console.error(`  ❌ Failed to save ${filePath}:`, e);
+    error(`Failed to save ${filePath}: ${e}`, 2);
   }
 }
 
@@ -184,7 +185,7 @@ export function loadData(): typeof EMPTY_DATA & Record<string, any> {
   if (accountsSource || stateSource) {
     // Save migrated data
     saveData(data);
-    console.log(`  ⚡ Migrated to consolidated file: ${DATA_FILE}`);
+    info(`Migrated to consolidated file: ${DATA_FILE}`, 2);
   }
 
   return data;
@@ -196,6 +197,32 @@ export function saveData(data: any) {
 
 export function loadAccounts() {
   return loadData().accounts || [];
+}
+
+/**
+ * Find an account by name, returning the account or null.
+ */
+export function findAccount(accounts: any[], name: string): any | null {
+  return accounts.find((a: any) => a.name === name) || null;
+}
+
+/**
+ * Find an account or print error and return null.
+ * Returns { account, abort } where abort=true means error was already printed.
+ */
+export function findAccountOrError(
+  accounts: any[],
+  name: string,
+): { account: any; abort: boolean } {
+  const account = findAccount(accounts, name);
+  if (!account) {
+    const available = accounts.map((a: any) => a.name).join(", ");
+    error(`Account '${name}' not found`, 2);
+    console.log(`       Available: ${available || "none"}`);
+    console.log(`       Run: bun src/cli.ts list\n`);
+    return { account: null, abort: true };
+  }
+  return { account, abort: false };
 }
 
 // ============================================================================

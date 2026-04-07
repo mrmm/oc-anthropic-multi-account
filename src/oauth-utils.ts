@@ -8,6 +8,22 @@ import {
 import { createOAuthTokenRequestInit } from "./oauth.js";
 
 /**
+ * Build authentication headers for API requests.
+ * @param account - The account object (OAuth or API key)
+ * @returns Headers object for fetch
+ */
+export function buildAuthHeaders(account: {
+  type?: string;
+  access?: string;
+  apiKey?: string;
+}): Record<string, string> {
+  if (account.type === "api_key" && account.apiKey) {
+    return { "x-api-key": account.apiKey };
+  }
+  return { authorization: `Bearer ${account.access}` };
+}
+
+/**
  * Build an OAuth authorization URL with PKCE parameters.
  * @param pkceChallenge - The PKCE code challenge
  * @param state - The OAuth state parameter

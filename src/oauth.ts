@@ -4,6 +4,7 @@ import * as clack from "@clack/prompts";
 import { CLIENT_ID, TOKEN_URL, CODE_CALLBACK_URL } from "./constants.js";
 import { loadData, saveData, upsertAccount } from "./data.js";
 import { buildAuthorizationUrl, exchangeCodeForTokens } from "./oauth-utils.js";
+import { success, error, info, header, plain } from "./ui-utils.js";
 
 export function createOAuthTokenRequestInit(
   params: Record<string, string | undefined>,
@@ -194,7 +195,7 @@ export async function cmdAdd(args: string[]) {
       data.accounts.push(account);
       saveData(data);
 
-      clack.outro(`Account '${inputName}' added with API key ✅`);
+      clack.outro(`Account '${inputName}' added with API key`);
       return;
     }
 
@@ -228,8 +229,7 @@ export async function cmdAdd(args: string[]) {
     name = inputName as string;
   }
 
-  console.log(`\n  🔐 Adding account: ${name}`);
-  console.log("  ────────────────────────────────────────\n");
+  header(`Adding account: ${name}`);
 
   // Direct mode - URL and code provided (always OAuth)
   if (authUrl && authCode) {
@@ -241,27 +241,21 @@ export async function cmdAdd(args: string[]) {
     const verifier = state;
 
     if (!verifier) {
-      console.error(
-        "  \u274c Could not extract state/verifier from URL or code",
-      );
-      console.error(
-        "     Run: bun src/cli.ts add " +
-          name +
-          "    Try interactive mode instead",
-      );
+      error("Could not extract state/verifier from URL or code");
+      plain(`Run: bun src/cli.ts add ${name}`, 5);
+      plain("Try interactive mode instead", 5);
       return;
     }
 
-    console.log("  \ud83d\udd10 Exchanging code for tokens...");
+    info("Exchanging code for tokens...", 2);
 
     let tokens;
     try {
       tokens = await exchangeCodeForTokens(code, verifier, state);
     } catch (err: any) {
-      console.error(`\n  \u274c ${err.message}`);
-      console.error(
-        "     \ud83d\udca1 Try again or use a fresh authorization URL\n",
-      );
+      error(err.message);
+      info("Try again or use a fresh authorization URL", 5);
+      plain("", 0);
       return;
     }
 
@@ -274,9 +268,10 @@ export async function cmdAdd(args: string[]) {
     });
     saveData(updated);
 
-    console.log(`\n  ✅ Account '${name}' added`);
-    console.log("     Restart OpenCode to use the new account");
-    console.log(`     Run: bun src/cli.ts usage    View usage metrics\n`);
+    success(`Account '${name}' added`, 2);
+    plain("Restart OpenCode to use the new account", 5);
+    info("Run: bun src/cli.ts usage    View usage metrics", 5);
+    plain("", 0);
     return;
   }
 
@@ -308,7 +303,8 @@ export async function cmdAdd(args: string[]) {
       return;
     }
     if (!apiKey) {
-      console.error("\n  \u274c No API key provided\n");
+      error("No API key provided", 2);
+      plain("", 0);
       return;
     }
 
@@ -319,9 +315,10 @@ export async function cmdAdd(args: string[]) {
     });
     saveData(updated);
 
-    console.log(`\n  ✅ Account '${name}' added with API key`);
-    console.log("     Restart OpenCode to use the new account");
-    console.log(`     Run: bun src/cli.ts usage    View usage metrics\n`);
+    success(`Account '${name}' added with API key`, 2);
+    plain("Restart OpenCode to use the new account", 5);
+    info("Run: bun src/cli.ts usage    View usage metrics", 5);
+    plain("", 0);
     return;
   }
 
@@ -350,16 +347,15 @@ export async function cmdAdd(args: string[]) {
     code = authParsed.code;
   }
 
-  console.log("\n  \u231b Exchanging code for tokens...");
+  info("Exchanging code for tokens...", 2);
 
   let tokens;
   try {
     tokens = await exchangeCodeForTokens(code, pkce.verifier, state);
   } catch (err: any) {
-    console.error(`\n  \u274c ${err.message}`);
-    console.error(
-      "     \ud83d\udca1 Try again or use a fresh authorization URL\n",
-    );
+    error(err.message, 2);
+    info("Try again or use a fresh authorization URL", 5);
+    plain("", 0);
     return;
   }
 
@@ -372,9 +368,10 @@ export async function cmdAdd(args: string[]) {
   });
   saveData(updated);
 
-  console.log(`\n  ✅ Account '${name}' added`);
-  console.log("     Restart OpenCode to use the new account");
-  console.log(`     Run: bun src/cli.ts usage    View usage metrics\n`);
+  success(`Account '${name}' added`, 2);
+  plain("Restart OpenCode to use the new account", 5);
+  info("Run: bun src/cli.ts usage    View usage metrics", 5);
+  plain("", 0);
 }
 
 export async function refreshToken(account: any): Promise<string | null> {

@@ -6,6 +6,7 @@ import {
   getAccountThresholds,
 } from "./thresholds.js";
 import { autoEvaluate } from "./auto-evaluate.js";
+import { Ansi, colorize as colorizeText } from "./ui-utils.js";
 
 function progressBar(
   utilization: number,
@@ -17,11 +18,11 @@ function progressBar(
   let bar = "";
   for (let i = 0; i < width; i++) {
     if (i === threshPos && threshPos > 0 && threshPos < width) {
-      bar += "\x1b[2m\u2502\x1b[0m"; // dim │ threshold marker
+      bar += `${Ansi.GRAY}\u2502${Ansi.RESET}`;
     } else if (i < filled) {
-      bar += "\u2501"; // ━ filled
+      bar += "\u2501";
     } else {
-      bar += "\x1b[2m\u2501\x1b[0m"; // dim ━ empty
+      bar += `${Ansi.GRAY}\u2501${Ansi.RESET}`;
     }
   }
   return bar;
@@ -79,10 +80,10 @@ function resolveStaleMetrics(state: any): boolean {
 
 function colorize(text: string, util: number, threshold: number): string {
   const ratio = threshold > 0 ? util / threshold : 0;
-  if (ratio >= 1) return `\x1b[31m${text}\x1b[0m`; // Red — over threshold
-  if (ratio >= 0.9) return `\x1b[33m${text}\x1b[0m`; // Yellow — 90-100% of threshold
-  if (ratio >= 0.7) return `\x1b[33m${text}\x1b[0m`; // Yellow — 70-90% of threshold
-  return `\x1b[32m${text}\x1b[0m`; // Green — under 70% of threshold
+  if (ratio >= 1) return `${Ansi.RED}${text}${Ansi.RESET}`;
+  if (ratio >= 0.9) return `${Ansi.YELLOW}${text}${Ansi.RESET}`;
+  if (ratio >= 0.7) return `${Ansi.YELLOW}${text}${Ansi.RESET}`;
+  return `${Ansi.GREEN}${text}${Ansi.RESET}`;
 }
 
 function relativeLastUsed(timestamp: string | null): string {
@@ -171,7 +172,7 @@ function renderUsage(watch: boolean) {
     const topPad = Math.max(0, CARD_W - 4 - titleContent.length);
     const topBorder = `  \u250c${titleContent}${"\u2500".repeat(topPad)}\u2510`;
     if (isActive) {
-      console.log(`\n\x1b[1;36m${topBorder}\x1b[0m`);
+      console.log(`\n${Ansi.BOLD}${Ansi.CYAN}${topBorder}${Ansi.RESET}`);
     } else {
       console.log(`\n${topBorder}`);
     }
@@ -179,10 +180,10 @@ function renderUsage(watch: boolean) {
     // Status line
     const authStatus =
       account.type === "api_key"
-        ? "\u2705 API Key"
+        ? "[OK] API Key"
         : account.expires > Date.now()
-          ? "\u2705 Authenticated"
-          : "\u26a0\ufe0f  Token expired";
+          ? "[OK] Authenticated"
+          : "[WARN] Token expired";
     const lastUsed = relativeLastUsed(usage?.timestamp || null);
 
     // Per-account request count from consumption data
@@ -234,8 +235,7 @@ function renderUsage(watch: boolean) {
 
     if (!usage) {
       const noData =
-        "\u26a0\ufe0f  No usage data \u2014 run: bun src/cli.ts ping " +
-        account.name;
+        "[WARN] No usage data - run: bun src/cli.ts ping " + account.name;
       const noDataInner = padToWidth(noData, CARD_W - 4);
       console.log(`  \u2502  ${noDataInner}\u2502`);
     } else {
@@ -260,20 +260,21 @@ function renderUsage(watch: boolean) {
             Math.round(th * BAR_W) > 0 &&
             Math.round(th * BAR_W) < BAR_W;
           if (isThreshPos) {
-            coloredBar += "\x1b[2m\u2502\x1b[0m";
+            coloredBar += `${Ansi.GRAY}\u2502${Ansi.RESET}`;
           } else if (i < filledCount) {
             const ratio = th > 0 ? u / th : 0;
-            if (ratio >= 1) coloredBar += "\x1b[31m\u2501\x1b[0m";
-            else if (ratio >= 0.7) coloredBar += "\x1b[33m\u2501\x1b[0m";
-            else coloredBar += "\x1b[32m\u2501\x1b[0m";
+            if (ratio >= 1) coloredBar += `${Ansi.RED}\u2501${Ansi.RESET}`;
+            else if (ratio >= 0.7)
+              coloredBar += `${Ansi.YELLOW}\u2501${Ansi.RESET}`;
+            else coloredBar += `${Ansi.GREEN}\u2501${Ansi.RESET}`;
           } else {
-            coloredBar += "\x1b[2m\u2501\x1b[0m";
+            coloredBar += `${Ansi.GRAY}\u2501${Ansi.RESET}`;
           }
         }
 
         const pctStr = `${pct}%${overMarker}`;
         const pctColored = colorize(pctStr.padStart(5), u, th);
-        const resetColored = `\x1b[2m${resetStr.padEnd(6)}\x1b[0m`;
+        const resetColored = `${Ansi.GRAY}${resetStr.padEnd(6)}${Ansi.RESET}`;
 
         const lineContent = `${label.padEnd(LABEL_W)}${coloredBar} ${pctColored}  ${resetColored}`;
         const lineInner = padToWidth(lineContent, CARD_W - 4);
@@ -304,7 +305,7 @@ function renderUsage(watch: boolean) {
       const byModel = consumption.byModel;
       if (byModel && Object.keys(byModel).length > 0) {
         console.log(`  \u2502${" ".repeat(CARD_W - 2)}\u2502`);
-        const modelHeader = "\x1b[2mBy model:\x1b[0m";
+        const modelHeader = `${Ansi.GRAY}By model:${Ansi.RESET}`;
         console.log(`  \u2502  ${padToWidth(modelHeader, CARD_W - 4)}\u2502`);
         for (const [modelName, modelData] of Object.entries(byModel) as [
           string,
@@ -389,14 +390,14 @@ function compactBar(
   for (let i = 0; i < width; i++) {
     if (i < filled) {
       const ratio = threshold > 0 ? utilization / threshold : 0;
-      if (ratio >= 1) bar += "\x1b[31m\u2501\x1b[0m";
-      else if (ratio >= 0.7) bar += "\x1b[33m\u2501\x1b[0m";
-      else bar += "\x1b[32m\u2501\x1b[0m";
+      if (ratio >= 1) bar += `${Ansi.RED}\u2501${Ansi.RESET}`;
+      else if (ratio >= 0.7) bar += `${Ansi.YELLOW}\u2501${Ansi.RESET}`;
+      else bar += `${Ansi.GREEN}\u2501${Ansi.RESET}`;
     } else {
-      bar += "\x1b[2m\u2591\x1b[0m";
+      bar += `${Ansi.GRAY}\u2591${Ansi.RESET}`;
     }
   }
-  bar += "\x1b[2m\u2502\x1b[0m";
+  bar += `${Ansi.GRAY}\u2502${Ansi.RESET}`;
   return bar;
 }
 
@@ -421,7 +422,7 @@ function renderCompactUsage(
     const usage = state?.usage?.[account.name];
     const activeTag = isActive ? " \u25c4" : "";
     const authOk = account.type === "api_key" || account.expires > Date.now();
-    const statusIcon = authOk ? "\u2705" : "\u26a0\ufe0f";
+    const statusIcon = authOk ? "[OK]" : "[WARN]";
     const acctT = getAccountThresholds(account.name, config);
     const thresholdMap: Record<string, number> = {
       session5h: acctT.session5h,
@@ -431,7 +432,7 @@ function renderCompactUsage(
 
     let cols = "";
     if (!usage) {
-      cols = "\x1b[2mno data\x1b[0m";
+      cols = `${Ansi.GRAY}no data${Ansi.RESET}`;
     } else {
       for (const key of ["session5h", "weekly7d", "weekly7dSonnet"] as const) {
         const u = usage[key]?.utilization || 0;

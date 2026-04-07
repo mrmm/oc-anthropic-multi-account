@@ -12,11 +12,21 @@ import {
   LEGACY_ACCOUNTS_FILE_LOCAL,
   LEGACY_STATE_FILE,
 } from "./constants.js";
-import { loadData, saveData, loadAccounts, upsertAccount } from "./data.js";
+import {
+  loadData,
+  saveData,
+  loadAccounts,
+  upsertAccount,
+  findAccountOrError,
+} from "./data.js";
 import { normalizeThresholds, getAccountThresholds } from "./thresholds.js";
 import { autoEvaluate, logSwitch } from "./auto-evaluate.js";
 import { refreshToken, prompt, createOAuthTokenRequestInit } from "./oauth.js";
-import { buildAuthorizationUrl, exchangeCodeForTokens } from "./oauth-utils.js";
+import {
+  buildAuthorizationUrl,
+  exchangeCodeForTokens,
+  buildAuthHeaders,
+} from "./oauth-utils.js";
 import {
   parseRateLimitHeaders,
   updateUsageState,
@@ -25,10 +35,18 @@ import {
   formatNumber,
   formatUSD,
 } from "./rate-limits.js";
-
-// ============================================================================
-// refresh command
-// ============================================================================
+import {
+  success,
+  error,
+  warning,
+  info,
+  plain,
+  header,
+  kv,
+  divider,
+  availableAccounts,
+  Ansi,
+} from "./ui-utils.js";
 
 const USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage";
 
@@ -41,29 +59,26 @@ export async function cmdRefresh(accountName?: string) {
     : accounts;
 
   if (!toRefresh.length) {
-    console.log(
-      accountName
-        ? `\n  ❌ Account '${accountName}' not found\n`
-        : "\n  ❌ No accounts configured\n",
-    );
+    if (accountName) {
+      error(`Account '${accountName}' not found`);
+    } else {
+      error("No accounts configured");
+    }
     return;
   }
 
-  console.log("\n  🔄 Refreshing usage data...\n");
+  info("Refreshing usage data...");
 
   for (const account of toRefresh) {
     if (account.type === "api_key") {
-      console.log(
-        `  ${account.name}: ⚠️  API key accounts — pinging for metrics`,
-      );
+      warning(`${account.name}: API key accounts — pinging for metrics`);
       await cmdPing(account.name, false);
       continue;
     }
 
-    // Ensure fresh token
     const refreshErr = await refreshToken(account);
     if (refreshErr) {
-      console.log(`  ${account.name}: ❌ ${refreshErr}`);
+      error(`${account.name}: ${refreshErr}`, 2);
       continue;
     }
 
@@ -78,19 +93,15 @@ export async function cmdRefresh(accountName?: string) {
       });
 
       if (!res.ok) {
-        console.log(`  ${account.name}: ❌ Usage API returned ${res.status}`);
+        error(`${account.name}: Usage API returned ${res.status}`, 2);
         continue;
       }
 
       const json = (await res.json()) as Record<string, any>;
 
-      // Update usage data
       data.usage[account.name] = data.usage[account.name] || {};
       const usage = data.usage[account.name];
 
-      // Usage API returns utilization as percentage (e.g. 81.0 for 81%)
-      // or as 0-1 fraction. Normalize to 0-1 scale for consistency with
-      // response headers which use 0-1 scale.
       function normalizeUtil(val: number): number {
         return val > 1 ? val / 100 : val;
       }
@@ -128,32 +139,27 @@ export async function cmdRefresh(accountName?: string) {
       usage.timestamp = new Date().toISOString();
       detectExtraCredit(usage);
 
-      // Display results
       const s5h = usage.session5h?.utilization || 0;
       const w7d = usage.weekly7d?.utilization || 0;
       const wSnt = usage.weekly7dSonnet?.utilization || 0;
-      const ec = usage.extraCredit?.detected ? "  ⚡ EXTRA CREDIT" : "";
+      const ec = usage.extraCredit?.detected ? " [OK] EXTRA CREDIT" : "";
 
-      console.log(`  ${account.name}${ec}`);
-      console.log(`    Session (5h)     ${Math.round(s5h * 100)}%`);
-      console.log(`    Weekly (all)     ${Math.round(w7d * 100)}%`);
-      console.log(
+      plain(`  ${account.name}${ec}`);
+      plain(`    Session (5h)     ${Math.round(s5h * 100)}%`);
+      plain(`    Weekly (all)     ${Math.round(w7d * 100)}%`);
+      plain(
         `    Weekly (Sonnet)  ${wSnt ? Math.round(wSnt * 100) + "%" : "—"}`,
       );
       console.log();
     } catch (err) {
-      console.log(`  ${account.name}: ❌ ${err}`);
+      error(`${account.name}: ${err}`, 2);
     }
   }
 
   autoEvaluate(data);
   saveData(data);
-  console.log("  ✅ Usage data refreshed\n");
+  success("Usage data refreshed");
 }
-
-// ============================================================================
-// costs command
-// ============================================================================
 
 export function cmdCosts(accountName?: string, args: string[] = []) {
   const data = loadData();
@@ -172,8 +178,8 @@ export function cmdCosts(accountName?: string, args: string[] = []) {
       }
     }
     saveData(data);
-    console.log(
-      `\n  ✅ Consumption data reset${accountName ? ` for '${accountName}'` : ""}\n`,
+    success(
+      `Consumption data reset${accountName ? ` for '${accountName}'` : ""}`,
     );
     return;
   }
@@ -183,72 +189,75 @@ export function cmdCosts(accountName?: string, args: string[] = []) {
     : accounts;
 
   if (!target.length) {
-    console.log(
-      accountName
-        ? `\n  ❌ Account '${accountName}' not found\n`
-        : "\n  ❌ No accounts configured\n",
-    );
+    if (accountName) {
+      error(`Account '${accountName}' not found`);
+    } else {
+      error("No accounts configured");
+    }
     return;
   }
 
-  console.log("\n  💰 Token Consumption");
-  console.log("  ────────────────────────────────────────\n");
+  header("Token Consumption");
 
   for (const account of target) {
     const usage = data.usage?.[account.name];
     const consumption = usage?.consumption;
 
     if (!consumption) {
-      console.log(`  ${account.name}: No consumption data yet`);
-      console.log(`    Run some queries to start tracking\n`);
+      plain(`  ${account.name}: No consumption data yet`);
+      plain(`    Run some queries to start tracking`);
+      console.log();
       continue;
     }
 
-    const ec = usage.extraCredit?.detected ? " ⚡ EXTRA CREDIT" : "";
-    console.log(`  ${account.name}${ec}`);
+    const ec = usage.extraCredit?.detected ? " [OK] EXTRA CREDIT" : "";
+    plain(`  ${account.name}${ec}`);
 
     if (sessionOnly) {
       const s = consumption.currentSession;
-      console.log(
+      plain(
         `    Session:  ${formatNumber(s.input)} in / ${formatNumber(s.output)} out  (${s.requests} reqs)  ${formatUSD(s.estimatedCost)}`,
+        4,
       );
     } else {
       const s = consumption.currentSession;
       const m = consumption.currentMonth;
       const a = consumption.allTime;
 
-      console.log(
+      plain(
         `    Session:  ${formatNumber(s.input)} in / ${formatNumber(s.output)} out  (${s.requests} reqs)  ${formatUSD(s.estimatedCost)}`,
+        4,
       );
-      console.log(
+      plain(
         `    Month:    ${formatNumber(m.input)} in / ${formatNumber(m.output)} out  (${m.requests} reqs)  ${formatUSD(m.estimatedCost)}`,
+        4,
       );
-      console.log(
+      plain(
         `    All-time: ${formatNumber(a.input)} in / ${formatNumber(a.output)} out  (${a.requests} reqs)  ${formatUSD(a.estimatedCost)}`,
+        4,
       );
 
-      // Per-model breakdown
       const models = Object.entries(consumption.byModel || {}) as [
         string,
         any,
       ][];
       if (models.length > 0) {
-        console.log(`\n    By model:`);
+        plain(`\n    By model:`, 4);
         for (const [model, stats] of models) {
-          console.log(
+          plain(
             `      ${model.padEnd(30)} ${formatNumber(stats.input)} in / ${formatNumber(stats.output)} out  ${formatUSD(stats.cost)}`,
+            6,
           );
         }
       }
 
-      // Extra credit info
       if (usage.extraCredit?.detected && usage.extraCredit.estimatedCost > 0) {
-        console.log(
-          `\n    ⚡ Extra credit: ${formatUSD(usage.extraCredit.estimatedCost)} estimated cost since ${new Date(usage.extraCredit.detectedAt).toLocaleDateString()}`,
+        plain(
+          `\n    [WARN] Extra credit: ${formatUSD(usage.extraCredit.estimatedCost)} estimated cost since ${new Date(usage.extraCredit.detectedAt).toLocaleDateString()}`,
+          4,
         );
       }
 
-      // Subscription value comparison
       const plan = account.plan;
       if (plan && m.estimatedCost > 0) {
         const planPrice =
@@ -262,11 +271,11 @@ export function cmdCosts(accountName?: string, args: string[] = []) {
                 : 0);
         if (planPrice > 0) {
           const valueRatio = Math.round((m.estimatedCost / planPrice) * 100);
-          console.log(
-            `\n    📊 Value: ${formatUSD(m.estimatedCost)} API equivalent / ${formatUSD(planPrice)} subscription (${valueRatio}%)`,
+          plain(
+            `\n    [INFO] Value: ${formatUSD(m.estimatedCost)} API equivalent / ${formatUSD(planPrice)} subscription (${valueRatio}%)`,
+            4,
           );
 
-          // Projection based on current rate
           const monthStart = new Date(m.since);
           const now = new Date();
           const daysPassed = Math.max(
@@ -281,8 +290,9 @@ export function cmdCosts(accountName?: string, args: string[] = []) {
           const projected =
             Math.round((m.estimatedCost / daysPassed) * daysInMonth * 100) /
             100;
-          console.log(
-            `    📈 Projected: ~${formatUSD(projected)} this month at current rate`,
+          plain(
+            `    [INFO] Projected: ~${formatUSD(projected)} this month at current rate`,
+            4,
           );
         }
       }
@@ -292,29 +302,20 @@ export function cmdCosts(accountName?: string, args: string[] = []) {
   }
 }
 
-// ============================================================================
-// Ping command
-// ============================================================================
-
 export async function cmdPing(alias: string, jsonMode: boolean = false) {
   try {
     const accounts = loadAccounts();
-    const account = accounts.find((item: any) => item.name === alias);
+    const { account, abort } = findAccountOrError(accounts, alias);
 
-    if (!account) {
-      const available = accounts.map((a: any) => a.name).join(", ");
+    if (abort) {
       if (jsonMode) {
         console.log(
           JSON.stringify({
             status: "error",
             alias,
-            error: `Account '${alias}' not found. Available: ${available || "none"}`,
+            error: `Account '${alias}' not found`,
           }),
         );
-      } else {
-        console.log(`\n  \u274c Account '${alias}' not found`);
-        console.log(`     Available: ${available || "none"}`);
-        console.log(`     Run: bun src/cli.ts list\n`);
       }
       return;
     }
@@ -331,17 +332,16 @@ export async function cmdPing(alias: string, jsonMode: boolean = false) {
           }),
         );
       } else {
-        console.log(`\n  \u274c Missing credentials for '${alias}'`);
-        console.log(`     Run: bun src/cli.ts reauth ${alias}\n`);
+        error(`Missing credentials for '${alias}'`);
+        plain(`     Run: bun src/cli.ts reauth ${alias}`);
       }
       return;
     }
 
     if (!jsonMode) {
-      console.log(`\n  \ud83d\udd0d Pinging ${alias}...`);
+      info(`Pinging ${alias}...`);
     }
 
-    // Refresh token if expired (skip for API key accounts)
     if (!isApiKey) {
       const refreshError = await refreshToken(account);
       if (refreshError) {
@@ -350,17 +350,15 @@ export async function cmdPing(alias: string, jsonMode: boolean = false) {
             JSON.stringify({ status: "error", alias, error: refreshError }),
           );
         } else {
-          console.log(`\n  \u274c Token refresh failed`);
-          console.log(`     ${refreshError}`);
-          console.log(`     Run: bun src/cli.ts reauth ${alias}\n`);
+          error("Token refresh failed");
+          plain(`     ${refreshError}`);
+          plain(`     Run: bun src/cli.ts reauth ${alias}`);
         }
         return;
       }
     }
 
-    const authHeaders: Record<string, string> = isApiKey
-      ? { "x-api-key": account.apiKey }
-      : { authorization: `Bearer ${account.access}` };
+    const authHeaders = buildAuthHeaders(account);
 
     const res = await fetch("https://api.anthropic.com/v1/messages?beta=true", {
       method: "POST",
@@ -379,7 +377,6 @@ export async function cmdPing(alias: string, jsonMode: boolean = false) {
     });
 
     if (res.ok) {
-      // Parse rate-limit headers and save usage to state (same headers as index.mjs)
       const quota = parseRateLimitHeaders(res);
       if (quota) {
         updateUsageState(alias, quota);
@@ -392,10 +389,9 @@ export async function cmdPing(alias: string, jsonMode: boolean = false) {
         return;
       }
 
-      console.log(`\n  \u2705 Account is reachable`);
+      success("Account is reachable");
 
       if (quota) {
-        // Determine overall status from metrics
         const statuses = [
           quota.session5h?.status,
           quota.weekly7d?.status,
@@ -405,16 +401,13 @@ export async function cmdPing(alias: string, jsonMode: boolean = false) {
           ? "limited"
           : "allowed";
 
-        console.log(`\n  \ud83d\udcca Rate Limits`);
-        console.log(
-          `  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500`,
-        );
+        header("Rate Limits");
         console.log(formatQuotaLine("Session (5h)", quota.session5h));
         console.log(formatQuotaLine("Weekly (all)", quota.weekly7d));
         console.log(formatQuotaLine("Weekly (Sonnet)", quota.weekly7dSonnet));
-        console.log(`\n  Status: ${overallStatus}`);
+        plain(`Status: ${overallStatus}`);
       } else {
-        console.log(`\n  \x1b[2mNo rate limit data in response\x1b[0m`);
+        plain("No rate limit data in response", 2);
       }
 
       console.log();
@@ -431,11 +424,9 @@ export async function cmdPing(alias: string, jsonMode: boolean = false) {
         }),
       );
     } else {
-      console.log(`\n  \u274c Request failed (HTTP ${res.status})`);
-      console.log(`     ${text.slice(0, 200)}`);
-      console.log(
-        `     Run: bun src/cli.ts test ${alias}    Full diagnostics\n`,
-      );
+      error(`Request failed (HTTP ${res.status})`);
+      plain(`     ${text.slice(0, 200)}`);
+      plain(`     Run: bun src/cli.ts test ${alias}    Full diagnostics`);
     }
   } catch (err) {
     if (jsonMode) {
@@ -443,9 +434,9 @@ export async function cmdPing(alias: string, jsonMode: boolean = false) {
         JSON.stringify({ status: "error", alias, error: String(err) }),
       );
     } else {
-      console.log(`\n  \u274c Connection error`);
-      console.log(`     ${String(err)}`);
-      console.log(`     Check your network and try again\n`);
+      error("Connection error");
+      plain(`     ${String(err)}`);
+      plain("     Check your network and try again");
     }
   }
 }
@@ -455,26 +446,21 @@ export async function cmdReauth(alias: string, args: string[]) {
 
   try {
     const accounts = loadAccounts();
-    const account = accounts.find((item: any) => item.name === alias);
+    const { account, abort } = findAccountOrError(accounts, alias);
 
-    if (!account) {
-      const available = accounts.map((a: any) => a.name).join(", ");
+    if (abort) {
       if (jsonMode) {
         console.log(
           JSON.stringify({
             status: "error",
             alias,
-            error: `Account '${alias}' not found. Available: ${available || "none"}`,
+            error: `Account '${alias}' not found`,
           }),
         );
-      } else {
-        console.error(`\n  \u274c Account '${alias}' not found`);
-        console.error(`     Available: ${available || "none"}\n`);
       }
       return;
     }
 
-    // Legacy JSON mode: callbackUrl and verifier passed as positional args
     const callbackUrl = args.find((a) => !a.startsWith("--") && a !== alias);
     const verifierArg = args.find(
       (a, i) =>
@@ -484,7 +470,6 @@ export async function cmdReauth(alias: string, args: string[]) {
     );
 
     if (jsonMode && callbackUrl) {
-      // Legacy step 2: exchange callback for tokens (scripting mode)
       const verifier = verifierArg;
       if (!verifier) {
         console.log(
@@ -532,7 +517,6 @@ export async function cmdReauth(alias: string, args: string[]) {
     }
 
     if (jsonMode && !callbackUrl) {
-      // Legacy step 1: generate auth URL (scripting mode)
       const pkce = await generatePKCE();
       const state = crypto.randomUUID().replace(/-/g, "");
       const url = buildAuthorizationUrl(pkce.challenge, state);
@@ -542,7 +526,6 @@ export async function cmdReauth(alias: string, args: string[]) {
       return;
     }
 
-    // Interactive mode — detect auth type, allow override with --method
     const methodFlag =
       args.find((a) => a.startsWith("--method="))?.split("=")[1] ||
       (args.includes("--method") ? args[args.indexOf("--method") + 1] : null);
@@ -559,16 +542,15 @@ export async function cmdReauth(alias: string, args: string[]) {
       methodFlag &&
       authType !== (account.type || (account.apiKey ? "api_key" : "oauth"));
 
-    console.log(`\n  \ud83d\udd10 Re-authenticating: ${alias}`);
-    console.log(
-      "  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n",
+    plain("");
+    info(`Re-authenticating: ${alias}`);
+    divider(2);
+    plain(
+      `  Auth type: ${label}${isOverride ? " (switching from " + (authType === "api_key" ? "OAuth" : "API Key") + ")" : ""}`,
     );
-    console.log(
-      `  Auth type: ${label}${isOverride ? " (switching from " + (authType === "api_key" ? "OAuth" : "API Key") + ")" : ""}\n`,
-    );
+    console.log();
 
     if (authType === "api_key") {
-      // Manual API key
       const apiKey = await clack.text({
         message: "Enter your API key",
         placeholder: "sk-ant-...",
@@ -585,11 +567,10 @@ export async function cmdReauth(alias: string, args: string[]) {
         type: "api_key",
       });
       saveData(updated);
-      console.log(`\n  ✅ API key saved for '${alias}'\n`);
+      success(`API key saved for '${alias}'`);
       return;
     }
 
-    // OAuth flow
     const pkce = await generatePKCE();
     const state = crypto.randomUUID().replace(/-/g, "");
 
@@ -610,21 +591,18 @@ export async function cmdReauth(alias: string, args: string[]) {
       const parsed = new URL(input);
       code = parsed.searchParams.get("code") || input;
     } catch {
-      // Handle code#state format (strip the state suffix)
       const parts = input.split("#");
       code = parts[0];
     }
 
-    console.log("\n  \u231b Exchanging tokens...");
+    info("Exchanging tokens...");
 
     let tokens;
     try {
       tokens = await exchangeCodeForTokens(code, pkce.verifier, state);
     } catch (err: any) {
-      console.error(`\n  \u274c ${err.message}`);
-      console.error(
-        "     \ud83d\udca1 Try again or use a fresh authorization URL\n",
-      );
+      error(err.message);
+      plain("     [INFO] Try again or use a fresh authorization URL");
       return;
     }
     const reauthOauthData = loadData();
@@ -637,107 +615,89 @@ export async function cmdReauth(alias: string, args: string[]) {
     saveData(updated);
 
     const expiresMin = Math.round(tokens.expiresIn / 60);
-    console.log(`  ✅ Account '${alias}' re-authenticated`);
-    console.log(`     Expires in ${expiresMin} minutes\n`);
-    console.log(`  Run: bun src/cli.ts test ${alias}    Verify connectivity\n`);
+    success(`Account '${alias}' re-authenticated`);
+    plain(`     Expires in ${expiresMin} minutes`);
+    plain(`  Run: bun src/cli.ts test ${alias}    Verify connectivity`);
   } catch (err) {
     if (jsonMode) {
       console.log(
         JSON.stringify({ status: "error", alias, error: String(err) }),
       );
     } else {
-      console.error(`\n  \u274c Error: ${String(err)}\n`);
+      error(`Error: ${String(err)}`);
     }
   }
 }
 
-// ============================================================================
-// set-primary command
-// ============================================================================
-
 export function cmdSetPrimary(name: string) {
   if (!name) {
-    console.log("\n  ❌ Missing account name");
-    console.log("  Usage: bun src/cli.ts set-primary <name>\n");
+    error("Missing account name");
+    plain("  Usage: bun src/cli.ts set-primary <name>");
     return;
   }
 
   const data = loadData();
   if (!data.accounts?.length) {
-    console.log("\n  ❌ No accounts configured");
-    console.log(
-      "     Run: bun src/cli.ts add <name>    Add an account first\n",
-    );
+    error("No accounts configured");
+    plain("     Run: bun src/cli.ts add <name>    Add an account first");
     return;
   }
 
   const account = data.accounts.find((a: any) => a.name === name);
   if (!account) {
     const available = data.accounts.map((a: any) => a.name).join(", ");
-    console.log(`\n  ❌ Account '${name}' not found`);
-    console.log(`     Available accounts: ${available}`);
-    console.log("     Run: bun src/cli.ts list\n");
+    error(`Account '${name}' not found`);
+    plain(`     Available accounts: ${available}`);
+    plain("     Run: bun src/cli.ts list");
     return;
   }
 
-  console.log("\n  ⚡ Set Primary Account");
-  console.log("  ────────────────────────────────────────\n");
+  header("Set Primary Account");
 
-  // Current order
-  console.log("  Before:");
+  plain("  Before:");
   data.accounts.forEach((a: any, i: number) => {
     const role = i === 0 ? " (primary)" : " (fallback)";
-    const marker = a.name === name ? " ◄" : "";
-    console.log(`    ${i + 1}. ${a.name}${role}${marker}`);
+    const marker = a.name === name ? " <-" : "";
+    plain(`    ${i + 1}. ${a.name}${role}${marker}`, 4);
   });
 
-  // Move account to front
   const idx = data.accounts.findIndex((a: any) => a.name === name);
   if (idx === 0) {
-    console.log(`\n  ✅ '${name}' is already the primary account\n`);
+    success(`'${name}' is already the primary account`);
     return;
   }
 
   const [removed] = data.accounts.splice(idx, 1);
   data.accounts.unshift(removed);
 
-  // New order
-  console.log("\n  After:");
+  plain("\n  After:");
   data.accounts.forEach((a: any, i: number) => {
     const role = i === 0 ? " (primary)" : " (fallback)";
-    console.log(`    ${i + 1}. ${a.name}${role}`);
+    plain(`    ${i + 1}. ${a.name}${role}`, 4);
   });
 
   saveData(data);
-  console.log(`\n  ✅ '${name}' is now the primary account`);
-  console.log("     Restart OpenCode to apply changes\n");
+  success(`'${name}' is now the primary account`);
+  plain("     Restart OpenCode to apply changes");
 }
-
-// ============================================================================
-// list command
-// ============================================================================
 
 export function cmdList() {
   const data = loadData();
   const accounts = data.accounts || [];
 
   if (!accounts.length) {
-    console.log("\n  ❌ No accounts configured");
-    console.log(
-      "     Run: bun src/cli.ts add <name>    Add your first account\n",
-    );
+    error("No accounts configured");
+    plain("     Run: bun src/cli.ts add <name>    Add your first account");
     return;
   }
 
-  console.log("\n  📋 Configured Accounts");
-  console.log("  ────────────────────────────────────────\n");
+  header("Configured Accounts");
 
-  // Table header
   const nameW = Math.max(6, ...accounts.map((a: any) => a.name.length)) + 2;
-  console.log(
+  plain(
     `  ${"#".padEnd(4)}${"Name".padEnd(nameW)}${"Role".padEnd(12)}${"Status".padEnd(20)}${"Expires"}`,
   );
-  console.log(
+  plain(
     `  ${"─".repeat(4)}${"─".repeat(nameW)}${"─".repeat(12)}${"─".repeat(20)}${"─".repeat(20)}`,
   );
 
@@ -745,94 +705,88 @@ export function cmdList() {
     const isActive = data.currentAccount === account.name;
     const isApiKey = account.type === "api_key";
     const status = isApiKey
-      ? "\u2705 API Key"
+      ? "[OK] API Key"
       : account.expires > Date.now()
-        ? "\u2705 Valid"
-        : "\u26a0\ufe0f  Expired";
+        ? "[OK] Valid"
+        : "[WARN] Expired";
     const role = i === 0 ? "primary" : "fallback";
-    const activeTag = isActive ? " \u25c4" : "";
+    const activeTag = isActive ? " <-" : "";
 
     let expiresStr = "";
     if (isApiKey) {
-      expiresStr = "\u221e";
+      expiresStr = "∞";
     } else if (account.expires > Date.now()) {
       const minsLeft = Math.floor((account.expires - Date.now()) / 60000);
       const hoursLeft = Math.floor(minsLeft / 60);
       const mins = minsLeft % 60;
       expiresStr = `${hoursLeft}h ${mins}m`;
     } else {
-      expiresStr = "\u2014";
+      expiresStr = "—";
     }
 
-    console.log(
+    plain(
       `  ${String(i + 1).padEnd(4)}${(account.name + activeTag).padEnd(nameW)}${role.padEnd(12)}${status.padEnd(20)}${expiresStr}`,
     );
   });
 
-  console.log(`\n  ────────────────────────────────────────`);
-  console.log(`  ${accounts.length} account(s) configured`);
+  plain(`\n  ${"─".repeat(40)}`);
+  plain(`  ${accounts.length} account(s) configured`);
 
-  // Show fix hints for expired accounts (skip API key accounts - they don't expire)
   const expired = accounts.filter(
     (a: any) => a.type !== "api_key" && a.expires <= Date.now(),
   );
   if (expired.length > 0) {
-    console.log(`\n  ⚠️  ${expired.length} account(s) have expired tokens:`);
+    warning(`${expired.length} account(s) have expired tokens:`);
     expired.forEach((a: any) => {
-      console.log(`     Run: bun src/cli.ts reauth ${a.name}`);
+      plain(`     Run: bun src/cli.ts reauth ${a.name}`);
     });
   }
 
-  console.log(`\n  💡 Run: bun src/cli.ts usage    View detailed metrics\n`);
+  plain("\n  [INFO] Run: bun src/cli.ts usage    View detailed metrics");
 }
-
-// ============================================================================
-// remove command
-// ============================================================================
 
 export function cmdRemove(name: string) {
   if (!name) {
-    console.log("\n  ❌ Missing account name");
-    console.log("  Usage: bun src/cli.ts remove <name>\n");
+    error("Missing account name");
+    plain("  Usage: bun src/cli.ts remove <name>");
     return;
   }
 
   const data = loadData();
   if (!data.accounts?.length) {
-    console.log("\n  ❌ No accounts configured\n");
+    error("No accounts configured");
     return;
   }
 
   const idx = data.accounts.findIndex((a: any) => a.name === name);
   if (idx < 0) {
     const available = data.accounts.map((a: any) => a.name).join(", ");
-    console.log(`\n  ❌ Account '${name}' not found`);
-    console.log(`     Available accounts: ${available}`);
-    console.log("     Run: bun src/cli.ts list\n");
+    error(`Account '${name}' not found`);
+    plain(`     Available accounts: ${available}`);
+    plain("     Run: bun src/cli.ts list");
     return;
   }
 
   const account = data.accounts[idx];
   const isPrimary = idx === 0;
 
-  console.log(`\n  🗑️  Remove Account`);
-  console.log("  ────────────────────────────────────────\n");
+  header("Remove Account");
 
   if (isPrimary) {
-    console.log("  ┌─────────────────────────────────────────┐");
-    console.log("  │  ⚠️  This is the PRIMARY account         │");
-    console.log("  └─────────────────────────────────────────┘\n");
+    plain("  ┌─────────────────────────────────────────┐");
+    plain("  │  [WARN] This is the PRIMARY account         │");
+    plain("  └─────────────────────────────────────────┘");
   }
 
-  console.log(`    Name:      ${account.name}`);
-  console.log(`    Role:      ${isPrimary ? "primary" : "fallback"}`);
-  console.log(
-    `    Status:    ${account.expires > Date.now() ? "✅ Authenticated" : "⚠️  Expired"}`,
+  plain(`    Name:      ${account.name}`, 4);
+  plain(`    Role:      ${isPrimary ? "primary" : "fallback"}`, 4);
+  plain(
+    `    Status:    ${account.expires > Date.now() ? "[OK] Authenticated" : "[WARN] Expired"}`,
+    4,
   );
 
   data.accounts.splice(idx, 1);
 
-  // Also remove usage data
   if (data.usage?.[name]) {
     delete data.usage[name];
   }
@@ -841,77 +795,58 @@ export function cmdRemove(name: string) {
   }
   saveData(data);
 
-  console.log(`\n  ✅ Account '${name}' removed`);
-  console.log("     Tokens revoked and usage data cleared");
+  success(`Account '${name}' removed`);
+  plain("     Tokens revoked and usage data cleared");
 
   if (isPrimary && data.accounts.length > 0) {
-    console.log(
-      `     ⚡ '${data.accounts[0].name}' is now the primary account`,
-    );
+    plain(`     [OK] '${data.accounts[0].name}' is now the primary account`);
   }
 
-  console.log(`\n  💡 Run: bun src/cli.ts add ${name}    Re-add later\n`);
+  plain("\n  [INFO] Run: bun src/cli.ts add ${name}    Re-add later");
 }
-
-// ============================================================================
-// test command
-// ============================================================================
 
 export async function cmdTest(name: string) {
   if (!name) {
-    console.log("\n  ❌ Missing account name");
-    console.log("  Usage: bun src/cli.ts test <name>\n");
+    error("Missing account name");
+    plain("  Usage: bun src/cli.ts test <name>");
     return;
   }
 
   const accounts = loadAccounts();
-  const account = accounts.find((a: any) => a.name === name);
+  const { account, abort } = findAccountOrError(accounts, name);
 
-  if (!account) {
-    const available = accounts.map((a: any) => a.name).join(", ");
-    console.log(`\n  ❌ Account '${name}' not found`);
-    console.log(`     Available accounts: ${available || "none"}`);
-    console.log("     Run: bun src/cli.ts list\n");
-    return;
-  }
+  if (abort) return;
 
-  console.log(`\n  🔍 Testing Account: ${name}`);
-  console.log("  ────────────────────────────────────────\n");
+  header(`Testing Account: ${name}`);
 
   const isApiKey = account.type === "api_key";
   let passed = 0;
   const total = 3;
 
-  // Step 1: Check token validity
-  console.log("  1. Checking token validity...");
+  plain("  1. Checking token validity...");
   if (isApiKey) {
-    console.log(`     \u2705 API key configured (does not expire)\n`);
+    success("API key configured (does not expire)", 5);
     passed++;
   } else if (account.access && account.expires > Date.now()) {
     const minsLeft = Math.floor((account.expires - Date.now()) / 60000);
-    console.log(`     \u2705 Token valid (expires in ${minsLeft} min)\n`);
+    success(`Token valid (expires in ${minsLeft} min)`, 5);
     passed++;
   } else {
-    console.log("     \u26a0\ufe0f  Token expired, attempting refresh...");
+    warning("Token expired, attempting refresh...", 5);
     const refreshError = await refreshToken(account);
     if (refreshError) {
-      console.log(`     \u274c Refresh failed: ${refreshError}`);
-      console.log(`     Run: bun src/cli.ts reauth ${name}\n`);
-      console.log(
-        `  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500`,
-      );
-      console.log(`  \u274c Result: ${passed}/${total} checks passed\n`);
+      error(`Refresh failed: ${refreshError}`, 5);
+      plain(`     Run: bun src/cli.ts reauth ${name}`);
+      divider(2);
+      error(`Result: ${passed}/${total} checks passed`);
       return;
     }
-    console.log("     \u2705 Token refreshed successfully\n");
+    success("Token refreshed successfully", 5);
     passed++;
   }
 
-  // Step 2: Send test request (inline ping)
-  console.log("  2. Sending API test request...");
-  const authHeaders: Record<string, string> = isApiKey
-    ? { "x-api-key": account.apiKey }
-    : { authorization: `Bearer ${account.access}` };
+  plain("  2. Sending API test request...");
+  const authHeaders = buildAuthHeaders(account);
 
   const res = await fetch("https://api.anthropic.com/v1/messages?beta=true", {
     method: "POST",
@@ -931,149 +866,137 @@ export async function cmdTest(name: string) {
 
   if (!res.ok) {
     const text = await res.text();
-    console.log(`     ❌ Request failed (HTTP ${res.status})`);
-    console.log(`        ${text.slice(0, 200)}\n`);
-    console.log(`  ────────────────────────────────────────`);
-    console.log(`  ❌ Result: ${passed}/${total} checks passed\n`);
+    error(`Request failed (HTTP ${res.status})`, 5);
+    plain(`        ${text.slice(0, 200)}`);
+    divider(2);
+    error(`Result: ${passed}/${total} checks passed`);
     return;
   }
 
-  console.log("     ✅ API request successful\n");
+  success("API request successful", 5);
   passed++;
 
-  // Step 3: Check rate limits
-  console.log("  3. Reading rate limit headers...");
+  plain("  3. Reading rate limit headers...");
   const quota = parseRateLimitHeaders(res);
   if (quota) {
     updateUsageState(name, quota);
     if (quota.session5h) {
-      console.log(
-        `     ✅ Session (5h):    ${Math.round(quota.session5h.utilization * 100)}% utilized`,
+      success(
+        `Session (5h):    ${Math.round(quota.session5h.utilization * 100)}% utilized`,
+        5,
       );
     }
     if (quota.weekly7d) {
-      console.log(
-        `     ✅ Weekly (all):    ${Math.round(quota.weekly7d.utilization * 100)}% utilized`,
+      success(
+        `Weekly (all):    ${Math.round(quota.weekly7d.utilization * 100)}% utilized`,
+        5,
       );
     }
     if (quota.weekly7dSonnet) {
-      console.log(
-        `     ✅ Weekly (Sonnet): ${Math.round(quota.weekly7dSonnet.utilization * 100)}% utilized`,
+      success(
+        `Weekly (Sonnet): ${Math.round(quota.weekly7dSonnet.utilization * 100)}% utilized`,
+        5,
       );
     }
     passed++;
   } else {
-    console.log("     ⚠️  No rate limit headers in response (non-fatal)");
-    passed++; // Still a pass - headers are optional
+    warning("No rate limit headers in response (non-fatal)", 5);
+    passed++;
   }
 
-  console.log(`\n  ────────────────────────────────────────`);
-  console.log(`  ✅ Result: ${passed}/${total} checks passed`);
-  console.log(`     Account '${name}' is fully functional\n`);
+  divider(2);
+  success(`Result: ${passed}/${total} checks passed`);
+  plain(`     Account '${name}' is fully functional`);
 }
 
-// ============================================================================
-// diagnose command
-// ============================================================================
-
 export function cmdDiagnose() {
-  console.log("\n  🔍 System Diagnostics");
-  console.log("  ────────────────────────────────────────\n");
+  header("System Diagnostics");
 
   const data = loadData();
   let issues = 0;
 
-  // Check accounts
-  console.log("  Accounts:");
+  plain("  Accounts:");
   if (!data.accounts?.length) {
-    console.log("    ❌ No accounts configured");
-    console.log("       Run: bun src/cli.ts add <name>\n");
+    error("No accounts configured", 4);
+    plain("       Run: bun src/cli.ts add <name>", 4);
     issues++;
   } else {
-    console.log(`    ✅ Found ${data.accounts.length} account(s)`);
+    success(`Found ${data.accounts.length} account(s)`, 4);
     data.accounts.forEach((account: any, i: number) => {
       const isApiKey = account.type === "api_key";
       const isExpired = !isApiKey && account.expires <= Date.now();
       const status = isApiKey
-        ? "\u2705 API Key"
+        ? "[OK] API Key"
         : isExpired
-          ? "\u26a0\ufe0f  Expired"
-          : "\u2705 Valid";
-      console.log(`       ${i + 1}. ${account.name} \u2014 ${status}`);
+          ? "[WARN] Expired"
+          : "[OK] Valid";
+      plain(`       ${i + 1}. ${account.name} — ${status}`, 4);
       if (isExpired) {
-        console.log(`          Run: bun src/cli.ts reauth ${account.name}`);
+        plain(`          Run: bun src/cli.ts reauth ${account.name}`, 4);
         issues++;
       }
     });
     console.log();
   }
 
-  // Check state
-  console.log("  State:");
+  plain("  State:");
   if (data.currentAccount) {
-    console.log(`    ✅ Active account: ${data.currentAccount}`);
+    success(`Active account: ${data.currentAccount}`, 4);
   } else {
-    console.log("    ⚠️  No active account set");
+    warning("No active account set", 4);
     issues++;
   }
-  console.log(`    ✅ Request count: ${data.requestCount || 0}`);
+  success(`Request count: ${data.requestCount || 0}`, 4);
 
   if (data.usage && Object.keys(data.usage).length > 0) {
     const accountNames = Object.keys(data.usage);
-    console.log(`    ✅ Usage data: ${accountNames.length} account(s)`);
+    success(`Usage data: ${accountNames.length} account(s)`, 4);
   } else {
-    console.log("    ⚠️  No usage data");
+    warning("No usage data", 4);
     issues++;
   }
 
   if (data.config) {
     const t = normalizeThresholds(data.config.threshold, DEFAULTS.threshold);
-    console.log(
-      `    ✅ Config: threshold ${Math.round(t.session5h * 100)}%/${Math.round(t.weekly7d * 100)}%/${Math.round(t.weekly7dSonnet * 100)}%, interval ${(data.config.checkInterval || DEFAULTS.checkInterval) / 60000}min`,
+    success(
+      `Config: threshold ${Math.round(t.session5h * 100)}%/${Math.round(t.weekly7d * 100)}%/${Math.round(t.weekly7dSonnet * 100)}%, interval ${(data.config.checkInterval || DEFAULTS.checkInterval) / 60000}min`,
+      4,
     );
   }
   console.log();
 
-  // OAuth config
-  console.log("  OAuth:");
-  console.log("    ✅ Client ID configured");
-  console.log(`    ✅ Token URL: ${TOKEN_URL}`);
-  console.log(`    ✅ Callback URL: ${CODE_CALLBACK_URL}`);
-  console.log("    ✅ Required scopes present\n");
-
-  // File locations
-  console.log("  Files:");
-  console.log(`    ✅ Data: ${DATA_FILE}`);
+  plain("  OAuth:");
+  success("Client ID configured", 4);
+  success(`Token URL: ${TOKEN_URL}`, 4);
+  success(`Callback URL: ${CODE_CALLBACK_URL}`, 4);
+  success("Required scopes present", 4);
   console.log();
 
-  // Summary
-  console.log("  ────────────────────────────────────────");
+  plain("  Files:");
+  success(`Data: ${DATA_FILE}`, 4);
+  console.log();
+
+  divider(2);
   if (issues === 0) {
-    console.log("  ✅ All checks passed — system is healthy");
+    success("All checks passed — system is healthy");
   } else {
-    console.log(`  ⚠️  ${issues} issue(s) found:`);
+    warning(`${issues} issue(s) found:`);
     if (!data.accounts?.length) {
-      console.log("     - No accounts configured");
+      plain("     - No accounts configured");
     }
     if (data.accounts?.some((a: any) => a.expires <= Date.now())) {
-      console.log("     - Some accounts need re-authentication");
+      plain("     - Some accounts need re-authentication");
     }
     if (!data.currentAccount) {
-      console.log("     - No active account set");
+      plain("     - No active account set");
     }
   }
-  console.log("     Run: bun src/cli.ts usage    View detailed metrics\n");
+  plain("     Run: bun src/cli.ts usage    View detailed metrics");
 }
 
-// ============================================================================
-// migrate command
-// ============================================================================
-
 export function cmdMigrate() {
-  console.log("\n  🔍 Migration Assistant");
-  console.log("  ────────────────────────────────────────\n");
+  header("Migration Assistant");
 
-  // Check for legacy files
   const legacyFiles = [
     {
       path: LEGACY_ACCOUNTS_FILE,
@@ -1090,75 +1013,65 @@ export function cmdMigrate() {
   const foundLegacy = legacyFiles.filter((f) => existsSync(f.path));
 
   if (foundLegacy.length === 0) {
-    console.log("  ✅ No legacy files found — installation is up to date\n");
+    success("No legacy files found — installation is up to date");
     return;
   }
 
-  console.log(`  ⚠️  Found ${foundLegacy.length} legacy file(s):\n`);
+  warning(`Found ${foundLegacy.length} legacy file(s):`);
   foundLegacy.forEach((f, i) => {
-    console.log(`    ${i + 1}. ${f.path}`);
-    console.log(`       Version: ${f.version}`);
+    plain(`    ${i + 1}. ${f.path}`);
+    plain(`       Version: ${f.version}`);
   });
 
-  console.log(`\n  New location: ${DATA_FILE}\n`);
+  plain(`\n  New location: ${DATA_FILE}`);
 
-  console.log("  Migration will:");
-  console.log("    1. Move accounts to new location");
-  console.log("    2. Update auth endpoints to platform.claude.com");
-  console.log("    3. Preserve all tokens and usage data");
-  console.log("    4. Create backups of original files\n");
+  console.log("\n  Migration will:");
+  plain("    1. Move accounts to new location");
+  plain("    2. Update auth endpoints to platform.claude.com");
+  plain("    3. Preserve all tokens and usage data");
+  plain("    4. Create backups of original files");
 
-  console.log("  ┌─────────────────────────────────────────────────────┐");
-  console.log("  │  ⚠️  Due to endpoint changes, you will need to      │");
-  console.log("  │     re-authorize accounts after migration            │");
-  console.log("  └─────────────────────────────────────────────────────┘\n");
+  console.log();
+  plain("  ┌─────────────────────────────────────────────────────┐");
+  plain("  │  [WARN] Due to endpoint changes, you will need to      │");
+  plain("  │     re-authorize accounts after migration            │");
+  plain("  └─────────────────────────────────────────────────────┘");
 
-  console.log("  Next steps:");
-  console.log("    1. Restart OpenCode (migration runs automatically)");
-  console.log("    2. Re-authorize each account:");
-  console.log("       Run: bun src/cli.ts reauth <account-name>");
-  console.log("    3. Or add accounts fresh:");
-  console.log("       Run: bun src/cli.ts add <account-name>\n");
+  console.log("\n  Next steps:");
+  plain("    1. Restart OpenCode (migration runs automatically)");
+  plain("    2. Re-authorize each account:");
+  plain("       Run: bun src/cli.ts reauth <account-name>");
+  plain("    3. Or add accounts fresh:");
+  plain("       Run: bun src/cli.ts add <account-name>");
 }
-
-// ============================================================================
-// switch command
-// ============================================================================
 
 export function cmdSwitch(name: string) {
   if (!name) {
-    console.log("\n  ❌ Missing account name");
-    console.log("  Usage: bun src/cli.ts switch <name>\n");
+    error("Missing account name");
+    plain("  Usage: bun src/cli.ts switch <name>");
     return;
   }
 
   const accounts = loadAccounts();
-  const account = accounts.find((a: any) => a.name === name);
+  const { account, abort } = findAccountOrError(accounts, name);
 
-  if (!account) {
-    console.log(`\n  ❌ Account '${name}' not found`);
-    console.log(`  Available: ${accounts.map((a: any) => a.name).join(", ")}`);
-    console.log("  Run: bun src/cli.ts list\n");
-    return;
-  }
+  if (abort) return;
 
   const data = loadData();
   const previous = data.currentAccount || accounts[0]?.name;
 
   if (previous === name) {
-    console.log(`\n  ✅ Already using '${name}'\n`);
+    success(`Already using '${name}'`);
     return;
   }
 
   data.currentAccount = name;
-  data.lastPrimaryCheck = Date.now(); // Reset check timer
+  data.lastPrimaryCheck = Date.now();
   logSwitch(data, previous, name, "manual switch");
   saveData(data);
 
-  console.log(`\n  ⚡ Switched: ${previous} → ${name}`);
-  console.log(`  Active account is now '${name}'`);
-  console.log("\n  Note: Automatic threshold switching will resume normally.");
-  console.log(
-    "  The system may switch away if this account exceeds thresholds.\n",
-  );
+  success(`Switched: ${previous} → ${name}`);
+  plain("  Active account is now '${name}'");
+  plain("  Note: Automatic threshold switching will resume normally.");
+  plain("  The system may switch away if this account exceeds thresholds.");
 }
