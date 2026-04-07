@@ -183,12 +183,15 @@ function renderUsage(watch: boolean) {
         : account.expires > Date.now()
           ? "\u2705 Authenticated"
           : "\u26a0\ufe0f  Token expired";
-    const reqCount = totalRequests;
     const lastUsed = relativeLastUsed(usage?.timestamp || null);
+
+    // Per-account request count from consumption data
+    const acctRequests = usage?.consumption?.allTime?.requests || 0;
 
     // Plan and cost info
     const PLAN_PRICES_DISPLAY: Record<string, number> = {
       pro: 20,
+      team: 30,
       max5x: 100,
       max20x: 200,
     };
@@ -214,7 +217,7 @@ function renderUsage(watch: boolean) {
       }
     }
 
-    const statusLine = `${authStatus} \u00b7 ${isActive ? reqCount + " requests" : "0 requests"} \u00b7 ${isActive ? "last used " + lastUsed : "idle"}`;
+    const statusLine = `${authStatus} \u00b7 ${acctRequests} requests \u00b7 ${usage?.timestamp ? "last used " + lastUsed : "idle"}`;
     const statusInner = padToWidth(statusLine, CARD_W - 4);
     console.log(`  \u2502  ${statusInner}\u2502`);
 
@@ -275,6 +278,45 @@ function renderUsage(watch: boolean) {
         const lineContent = `${label.padEnd(LABEL_W)}${coloredBar} ${pctColored}  ${resetColored}`;
         const lineInner = padToWidth(lineContent, CARD_W - 4);
         console.log(`  \u2502  ${lineInner}\u2502`);
+      }
+    }
+
+    // Consumption breakdown
+    const consumption = usage?.consumption;
+    if (consumption) {
+      console.log(`  \u2502${" ".repeat(CARD_W - 2)}\u2502`);
+      const sessReq = consumption.currentSession?.requests || 0;
+      const sessCost = consumption.currentSession?.estimatedCost || 0;
+      const monthReq = consumption.currentMonth?.requests || 0;
+      const monthCostVal = consumption.currentMonth?.estimatedCost || 0;
+      const allReq = consumption.allTime?.requests || 0;
+      const allCost = consumption.allTime?.estimatedCost || 0;
+
+      const sessLine = `Session:  ${sessReq} req  \u00b7  $${sessCost.toFixed(2)}`;
+      const monthLine = `Month:    ${monthReq} req  \u00b7  $${monthCostVal.toFixed(2)}`;
+      const allLine = `All-time: ${allReq} req  \u00b7  $${allCost.toFixed(2)}`;
+
+      console.log(`  \u2502  ${padToWidth(sessLine, CARD_W - 4)}\u2502`);
+      console.log(`  \u2502  ${padToWidth(monthLine, CARD_W - 4)}\u2502`);
+      console.log(`  \u2502  ${padToWidth(allLine, CARD_W - 4)}\u2502`);
+
+      // Per-model breakdown (if any)
+      const byModel = consumption.byModel;
+      if (byModel && Object.keys(byModel).length > 0) {
+        console.log(`  \u2502${" ".repeat(CARD_W - 2)}\u2502`);
+        const modelHeader = "\x1b[2mBy model:\x1b[0m";
+        console.log(`  \u2502  ${padToWidth(modelHeader, CARD_W - 4)}\u2502`);
+        for (const [modelName, modelData] of Object.entries(byModel) as [
+          string,
+          any,
+        ][]) {
+          const shortName =
+            modelName.length > 30
+              ? modelName.slice(0, 30) + "\u2026"
+              : modelName;
+          const modelLine = `  ${shortName.padEnd(32)} $${(modelData.cost || 0).toFixed(2)}`;
+          console.log(`  \u2502  ${padToWidth(modelLine, CARD_W - 4)}\u2502`);
+        }
       }
     }
 
@@ -432,11 +474,12 @@ function renderUsageJson() {
   }
 
   const result = {
-    version: "1.0",
+    version: "1.1",
     activeAccount: data.currentAccount || accounts[0]?.name || null,
     accounts: accounts.map((account: any) => {
       const isActive = data.currentAccount === account.name;
       const usage = data.usage?.[account.name] || {};
+      const consumption = usage.consumption || {};
       return {
         name: account.name,
         active: isActive,
@@ -454,6 +497,30 @@ function renderUsageJson() {
           session5h: usage.session5h?.reset || null,
           weekly7d: usage.weekly7d?.reset || null,
           weekly7dSonnet: usage.weekly7dSonnet?.reset || null,
+        },
+        consumption: {
+          session: {
+            requests: consumption.currentSession?.requests || 0,
+            inputTokens: consumption.currentSession?.input || 0,
+            outputTokens: consumption.currentSession?.output || 0,
+            estimatedCost: consumption.currentSession?.estimatedCost || 0,
+            since: consumption.currentSession?.since || null,
+          },
+          month: {
+            requests: consumption.currentMonth?.requests || 0,
+            inputTokens: consumption.currentMonth?.input || 0,
+            outputTokens: consumption.currentMonth?.output || 0,
+            estimatedCost: consumption.currentMonth?.estimatedCost || 0,
+            since: consumption.currentMonth?.since || null,
+          },
+          allTime: {
+            requests: consumption.allTime?.requests || 0,
+            inputTokens: consumption.allTime?.input || 0,
+            outputTokens: consumption.allTime?.output || 0,
+            estimatedCost: consumption.allTime?.estimatedCost || 0,
+            since: consumption.allTime?.since || null,
+          },
+          byModel: consumption.byModel || {},
         },
       };
     }),

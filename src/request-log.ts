@@ -1,6 +1,7 @@
 import { readFileSync, existsSync, statSync, readdirSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
+import { execSync } from "child_process";
 import { CONFIG_DIR } from "./constants.js";
 
 // ============================================================================

@@ -96,13 +96,15 @@ export function formatQuotaLine(
 // Token consumption & extra credit (shared with index.mjs)
 // ============================================================================
 
-export const MODEL_PRICING: Record<string, [number, number]> = {
-  haiku: [1.0, 5.0],
-  sonnet: [3.0, 15.0],
-  opus: [15.0, 75.0],
+export const MODEL_PRICING: Record<string, [number, number, number, number]> = {
+  haiku: [1.0, 5.0, 0.1, 1.25],
+  sonnet: [3.0, 15.0, 0.3, 3.75],
+  opus: [15.0, 75.0, 1.5, 18.75],
 };
 
-export function getModelPricing(model: string): [number, number] {
+export function getModelPricing(
+  model: string,
+): [number, number, number, number] {
   const m = model.toLowerCase();
   if (m.includes("haiku")) return MODEL_PRICING.haiku;
   if (m.includes("opus")) return MODEL_PRICING.opus;
@@ -113,9 +115,18 @@ export function calculateCost(
   model: string,
   input: number,
   output: number,
+  cacheRead: number = 0,
+  cacheWrite: number = 0,
 ): number {
-  const [inputPrice, outputPrice] = getModelPricing(model);
-  return (input * inputPrice + output * outputPrice) / 1_000_000;
+  const [inputPrice, outputPrice, cacheReadPrice, cacheWritePrice] =
+    getModelPricing(model);
+  return (
+    (input * inputPrice +
+      output * outputPrice +
+      cacheRead * cacheReadPrice +
+      cacheWrite * cacheWritePrice) /
+    1_000_000
+  );
 }
 
 export function detectExtraCredit(usage: any) {

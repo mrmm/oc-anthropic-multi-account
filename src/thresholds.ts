@@ -1,27 +1,5 @@
-import { DEFAULTS, CLIENT_ID } from "./constants.js";
+import { DEFAULTS } from "./constants.js";
 import type { PerMetric } from "./constants.js";
-
-export function createOAuthTokenRequestInit(
-  params: Record<string, string | undefined>,
-) {
-  const body: Record<string, string> = {};
-
-  for (const [key, value] of Object.entries(params)) {
-    if (typeof value !== "undefined" && value !== null) {
-      body[key] = String(value);
-    }
-  }
-
-  return {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/json, text/plain, */*",
-      "User-Agent": "axios/1.13.6",
-    },
-    body: JSON.stringify(body),
-  };
-}
 
 export function normalizeThresholds(value: any, fallback: number): PerMetric {
   if (typeof value === "number")

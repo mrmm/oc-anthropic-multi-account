@@ -17,13 +17,9 @@ import {
   LEGACY_STATE_FILE,
 } from "./constants.js";
 import { loadData, saveData, loadAccounts } from "./data.js";
-import {
-  normalizeThresholds,
-  getAccountThresholds,
-  createOAuthTokenRequestInit,
-} from "./thresholds.js";
+import { normalizeThresholds, getAccountThresholds } from "./thresholds.js";
 import { autoEvaluate, logSwitch } from "./auto-evaluate.js";
-import { refreshToken, prompt } from "./oauth.js";
+import { refreshToken, prompt, createOAuthTokenRequestInit } from "./oauth.js";
 import {
   parseRateLimitHeaders,
   updateUsageState,

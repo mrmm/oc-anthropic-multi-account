@@ -428,26 +428,6 @@ async function exchange(code, verifier, redirectUri, expectedState) {
 }
 
 /**
- * Select account using weighted rotation
- * @param {Array} accounts
- * @param {number} requestCount
- */
-// DEPRECATED: Replaced by selectThresholdAccount() in Task 3
-// function selectWeightedAccount(accounts, requestCount) {
-//   if (!accounts || accounts.length === 0) return null;
-//
-//   const totalWeight = accounts.reduce((sum, acc) => sum + (acc.weight || 1), 0);
-//   const position = requestCount % totalWeight;
-//
-//   let cumulative = 0;
-//   for (const account of accounts) {
-//     cumulative += (acc.weight || 1);
-//     if (position < cumulative) return account;
-//   }
-//   return accounts[0];
-// }
-
-/**
  * Normalize threshold/recover config - supports both a single number and per-metric object.
  * @param {number|{session5h?: number, weekly7d?: number, weekly7dSonnet?: number}} value
  * @param {number} fallback
@@ -498,7 +478,9 @@ const AUTH_FAILURE_COOLDOWN = 60 * 60 * 1000;
 let _pluginClient = null;
 const _lastLoggedUtilization = {};
 const UTILIZATION_LOG_DELTA = 0.05; // Only log when utilization changes by >5%
-const AUTO_TOAST_INTERVAL = 5; // Show auto-toast every N requests
+const AUTO_TOAST_INTERVAL = 25; // Show auto-toast every N requests
+const AUTO_TOAST_MIN_GAP_MS = 60_000; // At least 60s between auto-toasts
+let _lastAutoToastTime = 0;
 
 function _showToast(title, message, variant = "info", duration = 5000) {
   if (!_pluginClient?.tui?.showToast) return;
@@ -549,7 +531,6 @@ const LOGS_DIR = join(CONFIG_DIR, "anthropic-multi-account-logs");
 const LEGACY_LOG_FILE = join(CONFIG_DIR, "anthropic-multi-account-requests.jsonl");
 let _pluginDirectory = null;
 let _pluginWorktree = null;
-let _requestBodyMeta = null; // extracted from request body before fetch
 
 function _getMonthlyLogPath(date = new Date()) {
   const yyyy = date.getFullYear();
@@ -1017,7 +998,9 @@ function selectThresholdAccount(accounts, state) {
   }
 }
 
-let refreshPromise = null;
+// Per-account inflight refresh promises — prevents concurrent refreshes
+// for the same account while allowing different accounts to refresh independently.
+const _refreshPromises = new Map();
 
 async function ensureFreshAccountToken(account, data) {
   // API key accounts don't need token refresh
@@ -1029,9 +1012,10 @@ async function ensureFreshAccountToken(account, data) {
     return { ok: true };
   }
 
-  // Shared inflight refresh promise - prevents concurrent refreshes
-  if (!refreshPromise) {
-    refreshPromise = (async () => {
+  // Per-account inflight promise — prevents concurrent refreshes for the same
+  // account but does NOT share promises across different accounts.
+  if (!_refreshPromises.has(account.name)) {
+    const promise = (async () => {
       const maxRetries = 2;
       const baseDelayMs = 500;
 
@@ -1083,16 +1067,18 @@ async function ensureFreshAccountToken(account, data) {
           if (isNetworkError(error) && attempt < maxRetries) {
             continue;
           }
-          throw error;
+          return { ok: false, status: "network_error" };
         }
       }
+      return { ok: false, status: "max_retries_exhausted" };
     })().finally(() => {
-      refreshPromise = null;
+      _refreshPromises.delete(account.name);
     });
+
+    _refreshPromises.set(account.name, promise);
   }
 
-  await refreshPromise;
-  return { ok: true };
+  return _refreshPromises.get(account.name);
 }
 
 // ---------------------------------------------------------------------------
@@ -1567,8 +1553,10 @@ export async function AnthropicAuthPlugin({ client, directory, worktree }) {
                 _recordLoggedUtilization(account.name, currentUsage);
               }
 
-              // Auto-toast every N requests
-              if (data.requestCount % AUTO_TOAST_INTERVAL === 0) {
+              // Auto-toast every N requests (with minimum time gap to avoid spam)
+              const _now = Date.now();
+              if (data.requestCount % AUTO_TOAST_INTERVAL === 0 && (_now - _lastAutoToastTime) >= AUTO_TOAST_MIN_GAP_MS) {
+                _lastAutoToastTime = _now;
                 const lines = accounts.map((a) => {
                   const u = data.usage?.[a.name];
                   const tag = a.name === account.name ? "*" : " ";
