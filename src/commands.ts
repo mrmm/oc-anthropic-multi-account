@@ -3,10 +3,6 @@ import { existsSync } from "fs";
 import * as clack from "@clack/prompts";
 import {
   CLIENT_ID,
-  AUTHORIZE_URLS,
-  CODE_CALLBACK_URL,
-  TOKEN_URL,
-  OAUTH_SCOPES,
   REQUIRED_BETAS,
   CLAUDE_CLI_USER_AGENT,
   DEFAULTS,
@@ -20,6 +16,7 @@ import { loadData, saveData, loadAccounts, upsertAccount } from "./data.js";
 import { normalizeThresholds, getAccountThresholds } from "./thresholds.js";
 import { autoEvaluate, logSwitch } from "./auto-evaluate.js";
 import { refreshToken, prompt, createOAuthTokenRequestInit } from "./oauth.js";
+import { buildAuthorizationUrl, exchangeCodeForTokens } from "./oauth-utils.js";
 import {
   parseRateLimitHeaders,
   updateUsageState,
@@ -508,40 +505,25 @@ export async function cmdReauth(alias: string, args: string[]) {
         code = callbackUrl;
       }
 
-      const response = await fetch(
-        TOKEN_URL,
-        createOAuthTokenRequestInit({
-          code,
-          state: verifier,
-          grant_type: "authorization_code",
-          client_id: CLIENT_ID,
-          redirect_uri: CODE_CALLBACK_URL,
-          code_verifier: verifier,
-        }),
-      );
-
-      if (!response.ok) {
-        const text = await response.text();
+      let tokens;
+      try {
+        tokens = await exchangeCodeForTokens(code, verifier, verifier);
+      } catch (err: any) {
         console.log(
           JSON.stringify({
             status: "error",
             alias,
-            error: `Token exchange failed (${response.status}): ${text.slice(0, 200)}`,
+            error: err.message,
           }),
         );
         return;
       }
 
-      const json = (await response.json()) as {
-        access_token: string;
-        refresh_token: string;
-        expires_in: number;
-      };
       const reauthData = loadData();
       const updated = upsertAccount(reauthData, alias, {
-        access: json.access_token,
-        refresh: json.refresh_token,
-        expires: Date.now() + json.expires_in * 1000,
+        access: tokens.accessToken,
+        refresh: tokens.refreshToken,
+        expires: Date.now() + tokens.expiresIn * 1000,
         type: "oauth",
       });
       saveData(updated);
@@ -553,15 +535,7 @@ export async function cmdReauth(alias: string, args: string[]) {
       // Legacy step 1: generate auth URL (scripting mode)
       const pkce = await generatePKCE();
       const state = crypto.randomUUID().replace(/-/g, "");
-      const url = new URL(AUTHORIZE_URLS.max);
-      url.searchParams.set("code", "true");
-      url.searchParams.set("client_id", CLIENT_ID);
-      url.searchParams.set("response_type", "code");
-      url.searchParams.set("redirect_uri", CODE_CALLBACK_URL);
-      url.searchParams.set("scope", OAUTH_SCOPES.join(" "));
-      url.searchParams.set("code_challenge", pkce.challenge);
-      url.searchParams.set("code_challenge_method", "S256");
-      url.searchParams.set("state", state);
+      const url = buildAuthorizationUrl(pkce.challenge, state);
       console.log(
         JSON.stringify({ url: url.toString(), verifier: pkce.verifier, state }),
       );
@@ -619,15 +593,7 @@ export async function cmdReauth(alias: string, args: string[]) {
     const pkce = await generatePKCE();
     const state = crypto.randomUUID().replace(/-/g, "");
 
-    const url = new URL(AUTHORIZE_URLS.max);
-    url.searchParams.set("code", "true");
-    url.searchParams.set("client_id", CLIENT_ID);
-    url.searchParams.set("response_type", "code");
-    url.searchParams.set("redirect_uri", CODE_CALLBACK_URL);
-    url.searchParams.set("scope", OAUTH_SCOPES.join(" "));
-    url.searchParams.set("code_challenge", pkce.challenge);
-    url.searchParams.set("code_challenge_method", "S256");
-    url.searchParams.set("state", state);
+    const url = buildAuthorizationUrl(pkce.challenge, state);
 
     console.log("\n  1. Open this URL in your browser:\n");
     console.log(`     ${url.toString()}\n`);
@@ -651,45 +617,26 @@ export async function cmdReauth(alias: string, args: string[]) {
 
     console.log("\n  \u231b Exchanging tokens...");
 
-    const response = await fetch(
-      TOKEN_URL,
-      createOAuthTokenRequestInit({
-        code,
-        state: state,
-        grant_type: "authorization_code",
-        client_id: CLIENT_ID,
-        redirect_uri: CODE_CALLBACK_URL,
-        code_verifier: pkce.verifier,
-      }),
-    );
-
-    if (!response.ok) {
-      const text = await response.text();
-      console.error(
-        `\n  \u274c Token exchange failed (HTTP ${response.status})`,
-      );
-      console.error(`     ${text.slice(0, 200)}`);
+    let tokens;
+    try {
+      tokens = await exchangeCodeForTokens(code, pkce.verifier, state);
+    } catch (err: any) {
+      console.error(`\n  \u274c ${err.message}`);
       console.error(
         "     \ud83d\udca1 Try again or use a fresh authorization URL\n",
       );
       return;
     }
-
-    const json = (await response.json()) as {
-      access_token: string;
-      refresh_token: string;
-      expires_in: number;
-    };
     const reauthOauthData = loadData();
     const updated = upsertAccount(reauthOauthData, alias, {
-      access: json.access_token,
-      refresh: json.refresh_token,
-      expires: Date.now() + json.expires_in * 1000,
+      access: tokens.accessToken,
+      refresh: tokens.refreshToken,
+      expires: Date.now() + tokens.expiresIn * 1000,
       type: "oauth",
     });
     saveData(updated);
 
-    const expiresMin = Math.round(json.expires_in / 60);
+    const expiresMin = Math.round(tokens.expiresIn / 60);
     console.log(`  ✅ Account '${alias}' re-authenticated`);
     console.log(`     Expires in ${expiresMin} minutes\n`);
     console.log(`  Run: bun src/cli.ts test ${alias}    Verify connectivity\n`);
